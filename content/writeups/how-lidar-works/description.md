@@ -1,0 +1,1 @@
+The physics and electronics of a LiDAR measurement (time of flight, the LiDAR equation, emitters, detectors, FMCW and beam steering) and the structure of the data it produces: range images, point clouds, their density, occlusion, motion distortion and artefacts.

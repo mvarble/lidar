@@ -1,0 +1,173 @@
+---
+title: How LiDAR works, from photons to point clouds
+created: 2026-10-30
+---
+
+<script>
+    import Waveform from './Waveform.svelte';
+    import ScanPattern from './ScanPattern.svelte';
+</script>
+
+A LiDAR (light detection and ranging) sensor measures distance by timing light. It fires a short pulse of laser light, waits for the echo, and converts the round-trip time into a range; by steering the beam across a field of view many times a second it builds up a three-dimensional sample of its surroundings, the _point cloud_. This writeup explains how that happens: the physics of the measurement, the electronics that make it, the ways a beam is steered, and, most importantly for everything that follows in the course, the structure, density and defects of the data that comes out. Every algorithm in the later writeups is shaped by the facts established here: that the data is a sparse, irregular sample of surfaces, organised by beam and by time, that thins with distance and is riddled with occlusion shadows. A standard reference for the hardware is [](cite:mcmanamon2019).
+
+# Ranging by time of flight
+
+Light travels at $c \approx 2.998 \times 10^8$ m/s. If a pulse leaves the sensor at time $0$, reflects off a surface at range $r$ and arrives back at time $\Delta t$, it has travelled $2r$, so
+
+$$
+	r = \frac{c\,\Delta t}{2}. @tag(tof)
+$$
+
+The numbers set the engineering problem. One nanosecond of round-trip time corresponds to $15$ cm of range, so a target at $100$ m returns its echo after about $667$ ns, and resolving range to $1$ cm requires timing to about $67$ ps. That precision is achieved not with a fast clock alone but with a _time-to-digital converter_ (TDC), a circuit, often a chain of delay elements on a chip, that interpolates between clock edges to tens of picoseconds.
+
+Time of flight also bounds how fast a single laser may fire. If a second pulse leaves before the echo of the first has returned, the sensor cannot tell which pulse an echo belongs to. A laser fired at a pulse repetition frequency $f$ therefore has a maximum unambiguous range
+
+$$
+	r_{\max} = \frac{c}{2f},
+$$
+
+so a laser fired at $1$ MHz is unambiguous only to $150$ m. Sensors that need more points per second than one laser can give at the range they need use many lasers firing in parallel, which is one reason the multi-beam designs described below exist.
+
+# The emitter
+
+The light source is almost always a pulsed semiconductor laser, emitting pulses a few nanoseconds long at a peak power of tens of watts, though at an average power of milliwatts, since it is dark nearly all the time. Two wavelength bands dominate.
+
+- **Around 905 nm** (and nearby, such as 850–940 nm). Edge-emitting laser diodes and arrays of vertical-cavity surface-emitting lasers (VCSELs) at these wavelengths are cheap, and ordinary silicon detectors absorb them. The cost is eye safety: light in this band is focused by the eye onto the retina, so the international standard for laser safety (IEC 60825-1, whose "Class 1" every automotive LiDAR must meet) caps the pulse energy, and with it the range.
+- **Around 1550 nm**. Light at this wavelength is absorbed in the cornea and the fluid of the eye before it reaches the retina, which allows a far higher pulse energy at the same safety class, and so a longer range. Silicon is transparent here, so the detector must be made of indium gallium arsenide (InGaAs), which is considerably more expensive, and the source is usually a fibre laser.
+
+The beam leaves the sensor through optics that collimate it, but no beam is perfectly parallel: it spreads with a _divergence_ of typically a few tenths of a milliradian to a few milliradians. At divergence $\gamma$ the illuminated _footprint_ at range $r$ is about $\gamma r$ across, so a $3$ mrad beam lights a patch $30$ cm wide at $100$ m. A footprint of that size is larger than many of the details of a scene, and a footprint that falls across an edge is the origin of several of the artefacts described [below](#imperfections-of-the-data).
+
+# The receiver
+
+The echo is collected by a lens and focused onto a photodetector behind a narrow optical bandpass filter, which admits the laser's wavelength and rejects most of the sunlight. Four kinds of detector are in use, in increasing order of sensitivity.
+
+- A **PIN photodiode** produces a current proportional to the optical power falling on it, with no internal gain.
+- An **avalanche photodiode** (APD) is biased so that each photo-generated electron is accelerated hard enough to knock loose others, giving an internal gain of roughly tens to hundreds while remaining linear: the output current is still proportional to the power received.
+- A **single-photon avalanche diode** (SPAD) is biased beyond its breakdown voltage, in _Geiger mode_, so that a single photon triggers a self-sustaining avalanche, a digital click. A SPAD cannot tell one photon from many and is blind for a _dead time_ of some nanoseconds after each click, so it is read out statistically: over many laser shots, the clicks are accumulated into a histogram of arrival times (time-correlated single photon counting) whose peak marks the echo.
+- A **silicon photomultiplier** (SiPM) is an array of many SPADs summed into one output, which restores a rough proportionality to the number of photons arriving.
+
+For linear detectors, the photocurrent is turned into a voltage by a transimpedance amplifier and then either compared against a threshold, with the TDC timestamping the crossing, or digitised by a fast analogue-to-digital converter so that the whole waveform can be processed. Timing a fixed threshold has a flaw: a strong echo rises through the threshold earlier than a weak echo from the same range, so the measured range depends on the target's reflectivity. This _range walk_ is corrected either by calibration against the echo's amplitude or by _constant-fraction discrimination_, which times the moment the pulse reaches a fixed fraction of its own peak rather than a fixed level.
+
+<Waveform />
+
+# How much light comes back
+
+A target far from the sensor returns a tiny fraction of the light sent to it, and the fraction decides how far a sensor can see. Suppose a pulse of peak power $P_t$ falls entirely on a matte surface at range $r$, at an angle of incidence $\alpha$ to its normal, and the surface reflects a fraction $\rho$ of it, its _reflectivity_. A matte surface is well modelled as _Lambertian_: it scatters the reflected power $\rho P_t$ over the hemisphere above it with a radiant intensity of $(\rho P_t / \pi)\cos\beta$ watts per steradian in a direction at angle $\beta$ to its normal. The receiver sits back along the incoming beam, so $\beta = \alpha$, and its aperture of area $A_r$ subtends a solid angle of $A_r / r^2$. The received power is therefore
+
+$$
+	P_r = P_t \, \frac{\rho \cos\alpha}{\pi} \, \frac{A_r}{r^2} \, \eta \, T^2, @tag(lidar-equation)
+$$
+
+where $\eta$ collects the efficiency of the optics and $T$ is the one-way transmission of the atmosphere, squared because the light crosses it twice. This is the _LiDAR equation_ for an extended target, one large enough to intercept the whole beam. It has three consequences that matter throughout the course.
+
+The return falls with the square of the range, so doubling the distance to a target quarters its signal. A pulse of $75$ W peak, reflected by a surface of $10\%$ reflectivity at $100$ m into a receiver aperture $25$ mm across ($A_r \approx 4.9 \times 10^{-4}\ \mathrm{m}^2$) with $\eta = 0.5$, returns about $60$ nW, which over a $5$ ns pulse is of the order of a thousand photons at $905$ nm. Sensors are accordingly specified by their range _at a stated reflectivity_, typically $10\%$, roughly that of a dark car or a tyre; a sensor that sees a white wall at $200$ m may see a black car only at $80$ m.
+
+The return depends on reflectivity and on the angle of incidence as well as on range, so the strength of an echo, which sensors report as _intensity_, is not a property of the surface alone. Many sensors report a calibrated _reflectivity_ instead, having divided out the range and their own response; even so, a surface seen obliquely returns less than the same surface seen head-on. Intensity is nevertheless very useful: lane markings and road signs are coated with retroreflective paint that returns far more light than asphalt, so they stand out sharply, and maps of intensity are used to localise vehicles.
+
+Finally, weather enters through $T$. Fog, rain, snow, dust and exhaust both attenuate the beam and scatter some of it straight back, producing returns from the air itself.
+
+## Noise and precision
+
+The echo competes with noise: the shot noise of the signal photons themselves, background light (above all sunlight, which the bandpass filter reduces but cannot remove), and the thermal noise of the electronics. The ratio of signal to noise governs two separate things. It decides whether an echo is detected at all, through a trade between the probability of detection and the rate of false alarms that is set by the threshold. And it decides how precisely an echo is timed. A useful rule of thumb is that the timing jitter is about the rise time of the pulse divided by the signal-to-noise ratio, so the range precision is about
+
+$$
+	\sigma_r \approx \frac{c}{2} \, \frac{t_{\mathrm{rise}}}{\mathrm{SNR}},
+$$
+
+which is why a weak echo from a distant, dark target is not only less likely to be detected but noisier when it is. Typical automotive sensors quote a range precision of one to three centimetres, degrading at long range.
+
+# Frequency-modulated continuous wave
+
+Everything above concerns _pulsed_ (or _direct_) time of flight, which is what the great majority of sensors use. The main alternative, frequency-modulated continuous wave (FMCW) LiDAR, transmits continuously while sweeping its optical frequency linearly, a _chirp_ of bandwidth $B$ over a duration $T_c$. The echo is mixed with a copy of the outgoing light. Since the echo left earlier, by the round-trip time $2r/c$, its frequency differs from the current outgoing frequency by a _beat frequency_
+
+$$
+	f_b = \frac{B}{T_c} \cdot \frac{2r}{c},
+$$
+
+which is low enough (megahertz) to measure precisely, and which gives the range. If the target moves along the beam at radial velocity $v$, the echo is also Doppler-shifted by $f_D = 2v / \lambda$, which is $1.29$ MHz for every metre per second at $\lambda = 1550$ nm. Alternating rising and falling chirps separates the two effects, since the Doppler shift adds to the beat frequency on one and subtracts on the other.
+
+FMCW therefore measures the radial velocity of every point directly, which a pulsed sensor can only infer by comparing successive frames, and its coherent detection rejects sunlight and the pulses of other LiDARs. Its range resolution is set by the chirp bandwidth, $\Delta r = c / (2B)$, so $1$ GHz gives $15$ cm. The cost is the complexity of a narrow-linewidth laser and coherent optics, and FMCW sensors usually work at 1550 nm.
+
+# Steering the beam
+
+A single range measurement is one point. To sample a scene, the sensor must point its measurements across a field of view, and how it does so decides the shape of the data.
+
+- **Spinning multi-beam sensors** mount a vertical column of $N$ lasers and detectors, typically $16$, $32$, $64$ or $128$ _channels_, on a head that rotates about a vertical axis $10$ or $20$ times a second. Each channel sweeps a cone of fixed elevation, so the sensor sees $360°$ horizontally and a vertical field of view of perhaps $30°$ to $45°$. The Velodyne HDL-64E, which recorded the KITTI benchmark [](cite:geiger2012), is of this kind. The elevations of the channels are often spaced unevenly, concentrated near the horizon where distant objects are.
+- **Mechanical scanners with mirrors** keep the lasers fixed and move a mirror: a rotating polygon, an oscillating galvanometer, or a microelectromechanical (MEMS) mirror a few millimetres across. They usually cover a forward-facing field of view of about $120°$ and scan it in a raster or along a figure-of-eight pattern.
+- **Rotating prisms**, a pair of wedges spinning at different rates, trace a rosette that never repeats, so the scan fills the field of view more densely the longer it is integrated.
+- **Flash LiDAR** has no moving parts. It illuminates the whole field of view at once with a diffused pulse and images the echo onto a two-dimensional array of detectors, like a camera that measures time instead of brightness; arrays of SPADs make this practical. Some sensors are a hybrid, with a column of SPADs or a column of illumination swept across the scene.
+- **Optical phased arrays** steer the beam electronically by controlling the phase of light across an array of emitters, as phased-array radar does, though they remain largely a research technology.
+
+Whatever the mechanism, every measurement has a direction known from the geometry of the sensor (which channel fired, and the angle the head or mirror was at) and a range from the echo.
+
+# The structure of the data
+
+The rest of this writeup concerns what a sensor of the most common kind, a spinning multi-beam sensor, actually produces, since that data is what the rest of the course processes. Other scan patterns differ in detail but not in kind.
+
+## The raw measurement
+
+Each time a channel fires, the sensor records a small tuple: the channel index $i$ (the _ring_ or _beam_), the azimuth $\varphi$ of the rotating head read from an encoder, the range $r$ of each detected return, its intensity, and a timestamp. These are streamed over Ethernet in packets, each holding a block of consecutive firings, at rates of hundreds of thousands to a few million measurements per second. A sensor with $128$ channels taking $1024$ azimuth steps per revolution at $10$ Hz produces $128 \times 1024 \times 10 \approx 1.3$ million measurements per second, and twice that if it reports two returns per firing.
+
+The direction of a measurement is given in spherical coordinates: the azimuth $\varphi$ about the vertical axis and the elevation $\theta_i$ of channel $i$, fixed by the sensor's construction and listed in its calibration. The point in the sensor's own Cartesian frame (by the usual convention $x$ forward, $y$ left and $z$ up) is
+
+$$
+	\bfp =
+	\begin{pmatrix} x \\ y \\ z \end{pmatrix}
+	= r \begin{pmatrix} \cos\theta_i \cos\varphi \\ \cos\theta_i \sin\varphi \\ \sin\theta_i \end{pmatrix}. @tag(spherical)
+$$
+
+In a real sensor the channels do not all emit from the same point, so the manufacturer's calibration also gives each channel small horizontal and vertical offsets, and an azimuth correction, that are applied in the same conversion. Computing [](eq:spherical) is the first step of every LiDAR driver.
+
+## Range images and point clouds
+
+The measurements of one revolution, a _scan_ or _sweep_ or _frame_, can be stored in two equivalent ways, and practitioners move between them constantly.
+
+The **range image** keeps the sensor's own organisation: an $H \times W$ array, one row per channel and one column per azimuth step, each pixel holding a range (and, in further channels, intensity and anything else measured). It is exactly a depth image from a camera with a cylindrical lens. Neighbouring pixels are neighbouring measurements, so the image gives every point its neighbours for free, and image-processing operations and 2D convolutional networks apply to it directly. A firing that got no echo, because it pointed at the sky, at a target beyond range, or at a surface that absorbed or mirrored the light away, leaves a pixel empty, conventionally a range of $0$.
+
+The **point cloud** is the list of the $N$ points that do exist, as an $N \times K$ array whose columns are the coordinates $x, y, z$ from [](eq:spherical) together with whatever else is kept for each point: intensity, ring, return number, timestamp. The Point Cloud Library [](cite:rusu2011) calls a cloud that keeps the image layout, with a width and a height and invalid points marked as NaN, an _organised_ point cloud, and a flat list an _unorganised_ one. Once clouds from several scans or several sensors are merged, or a cloud is filtered or downsampled, the image layout is lost, and a cloud is then just a set of points with no inherent order. Finding which points are near which then requires the spatial data structures of a later writeup.
+
+<ScanPattern />
+
+In practice point clouds travel in a handful of formats. In ROS, the robotics middleware most research and much industry code is built on, a cloud is a `sensor_msgs/PointCloud2` message: a binary blob of fixed-size records together with a list of fields giving each one's name, byte offset and type, plus a `height` and `width` that are $1 \times N$ for an unorganised cloud. The Point Cloud Library's `.pcd` files have a short text header with the same information. The KITTI benchmark stores each scan as a raw `.bin` file of 32-bit floats, four per point: $x$, $y$, $z$ and reflectance. Airborne and survey LiDAR uses the ASPRS `.las` format (and its compressed form `.laz`), whose records carry GPS time, the return number and the number of returns of each shot, and a classification code such as ground, vegetation or building.
+
+## Sampling density
+
+A LiDAR samples the world on a grid of _directions_, not of positions, and that one fact explains most of what makes its data awkward. Two adjacent firings of the same channel are separated by the azimuth step $\Delta\varphi$, so at range $r$ the points they produce are about $r\,\Delta\varphi$ apart, and the density of points on a surface facing the sensor falls as $1/r^2$. At an azimuth step of $0.35°$ ($1024$ steps per revolution), adjacent points are $6$ cm apart at $10$ m and $60$ cm apart at $100$ m, where a pedestrian may be covered by a few dozen points or fewer.
+
+On the ground the effect is more extreme in the radial direction. A channel pointing below the horizon at an angle $|\theta|$, on a sensor at height $h$ above flat ground, meets the ground on a circle of radius $d = h / \tan|\theta|$. Differentiating, two channels separated by $\Delta\theta$ meet the ground at radii that differ by
+
+$$
+	\Delta d = \frac{h}{\sin^2\theta}\,\Delta\theta \approx \frac{d^2}{h}\,\Delta\theta,
+$$
+
+growing with the square of the distance. With $h = 1.8$ m and channels $0.35°$ apart, the rings on the ground are $1.4$ m apart at $20$ m, while the points along each ring are $12$ cm apart. The ground is sampled by concentric rings, densely along each ring and sparsely across them, which the figure above makes plain; algorithms that look for neighbours within a fixed radius, or that fit planes to the ground, must allow for this anisotropy.
+
+## Occlusion
+
+A LiDAR sees only the first surface along each beam. Everything behind an object, out to the sensor's range, is unobserved: the object casts a _shadow_ of empty space, as the cars and the pole do in the figure. An empty region in a point cloud therefore means either free space or unobserved space, and telling the two apart, which matters a great deal for deciding where a vehicle can drive, requires reasoning along the rays from the sensor rather than about the points alone. That reasoning is the subject of occupancy mapping.
+
+## Time and motion
+
+A spinning sensor does not take its scan at one instant. A revolution at $10$ Hz takes $100$ ms, and a vehicle travelling at $15$ m/s moves $1.5$ m in that time, so the first and last columns of a scan are measured from positions $1.5$ m apart, and the scan is distorted, much as a rolling-shutter camera distorts a moving scene. A static wall appears bent, and where the scan's start and end meet, a seam appears in which the same surface is recorded twice at different positions. This is why every point carries a timestamp, and why correcting the distortion, called _deskewing_ or _motion compensation_, using the vehicle's motion during the sweep, is a standard step of LiDAR processing. Objects that move during the sweep are distorted in the same way, by their own motion.
+
+# Imperfections of the data
+
+Real point clouds contain several characteristic artefacts, and knowing their causes is part of knowing the sensor.
+
+**Mixed pixels.** When a footprint straddles the edge of an object, part of the pulse returns from the object and part from whatever lies behind it. If the two echoes are far apart in time, the sensor reports two returns, as in the waveform figure above. If they are close, they merge into one distorted pulse whose detected time falls between them, and the sensor reports a point floating in the empty space between foreground and background. These _edge points_ or _veiling points_ trail behind the silhouettes of objects.
+
+**Multiple returns.** Because one shot can yield several echoes, sensors can be configured to report the strongest return, the last, or two of them. The first return of a shot through foliage, rain or a fence comes from the obstruction and the last from the surface behind it; airborne surveys rely on last returns to map the ground beneath a forest canopy.
+
+**Retroreflectors and blooming.** A retroreflective sign or number plate returns so much light that it can saturate the detector, biasing its range, and leak into neighbouring channels through stray light inside the sensor, so that a halo of spurious points, _blooming_, surrounds it.
+
+**Specular surfaces and multipath.** Glass, polished paint, puddles and wet roads reflect light like mirrors rather than scattering it. A mirror-like surface seen obliquely returns nothing, leaving a hole, while one that bounces the beam onto a matte surface and back produces a point at the length of the whole path, which appears behind a window or beneath the road surface.
+
+**Weather and atmosphere.** Rain, snow, fog, dust and exhaust produce sparse returns from the air near the sensor, at short range and low intensity, while attenuating the returns from everything beyond.
+
+**Interference.** Pulses from another LiDAR can be mistaken for echoes, producing isolated false points. Sensors defend against this by randomising the timing of their pulses or encoding them, so that foreign pulses do not line up from one shot to the next.
+
+Each of these is the reason for some filtering step that later writeups describe, and each is a reason why a LiDAR point cloud, unlike a synthetic one, is never a clean sample of a surface.
+
+# Summary
+
+A LiDAR measures, many times a second, the range along known directions by timing laser light, with [](eq:tof) relating time to range and [](eq:lidar-equation) deciding how far it can see. A spinning multi-beam sensor delivers these measurements organised as a range image, one row per channel and one column per azimuth step, and the conversion [](eq:spherical) turns them into a point cloud of $x, y, z$ with intensity, ring and timestamp. The resulting data samples surfaces, not volumes; its density falls with the square of the range and is strongly anisotropic on the ground; it is silent behind every object; it is smeared by the sensor's own motion; and it carries mixed pixels, spurious returns and holes. The next writeup in the course places these points in the world, through the coordinate frames and rigid transforms that relate a sensor to the vehicle carrying it and to everything else.
