@@ -90,10 +90,10 @@
     </ul>
     <figcaption>
         The points a LiDAR sees on a car: only the rear and one side, which face the sensor. The box
-        aligned with the points' principal axis is rotated by the diagonal of the L and is far too
-        large. Searching over headings for the rectangle whose edges the points lie closest to
-        recovers the car's heading and two of its sides; its far sides, which the sensor did not
-        see, remain unknown.
+        aligned with the points' principal axis is turned towards the diagonal of the L, so it fits
+        neither side and misstates the car's heading. Searching over headings for the rectangle
+        whose edges the points lie closest to recovers the car's heading and two of its sides; its
+        far sides, which the sensor did not see, remain unknown.
     </figcaption>
 </figure>
 

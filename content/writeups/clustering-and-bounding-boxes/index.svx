@@ -76,7 +76,7 @@ A cluster is summarised for downstream use by a geometric primitive: an axis-ali
 
 ## Boxes by PCA
 
-The obvious estimate of an object's heading is the principal axis of its points in the bird's-eye view, the eigenvector of the largest eigenvalue of their $2 \times 2$ covariance, with the box then fitted tightly around the points in that orientation. This works for clusters that cover an object fairly evenly, but a LiDAR sees only the faces of an object that face it. A car seen from behind and to one side yields two perpendicular lines of points, an _L-shape_, and the principal axis of an L runs along neither side but between them, so the PCA box is rotated and much too large.
+The obvious estimate of an object's heading is the principal axis of its points in the bird's-eye view, the eigenvector of the largest eigenvalue of their $2 \times 2$ covariance, with the box then fitted tightly around the points in that orientation. This works for clusters that cover an object fairly evenly, but a LiDAR sees only the faces of an object that face it. A car seen from behind and to one side yields two perpendicular lines of points, an _L-shape_, and the principal axis of an L runs along neither side but between them, so the PCA box is turned towards the diagonal, fits neither side, and gets the heading wrong.
 
 ## L-shape fitting
 
