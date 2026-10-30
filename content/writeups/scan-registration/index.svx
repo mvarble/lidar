@@ -1,0 +1,175 @@
+---
+title: Scan registration, from Kabsch to ICP and beyond
+created: 2026-10-30
+depends_on: [frames-and-transforms, normals-and-local-features]
+---
+
+<script>
+    import Statement from '@mvarble/mesearch/Statement.svelte';
+    import Proof from '@mvarble/mesearch/Proof.svelte';
+    import * as kabsch from './statements/kabsch.md';
+    import Icp from './Icp.svelte';
+</script>
+
+_Registration_ is the problem of finding the rigid transform that aligns one point cloud with another. It is the core of LiDAR odometry, which registers each scan to the previous ones to measure how the sensor moved; of localisation, which registers a scan to a prior map; of mapping, which registers scans to each other to build the map; and of calibration, which registers the views of two sensors. It is also the algorithm most likely to come up in an interview for a LiDAR role, usually in the form of the question "how does ICP work, and when does it fail?". This writeup answers that question in full. It begins with the case in which the correspondences between the clouds are known, which has a closed-form solution; builds the Iterative Closest Point algorithm on top of it; describes the variants used in practice, point-to-plane ICP, Generalized-ICP and the Normal Distributions Transform; and ends with global registration, for when no initial guess is available.
+
+This writeup builds on [Coordinate frames, rigid transforms and calibration](../frames-and-transforms/), for rigid transforms and the [small-angle linearisation](../frames-and-transforms/#small-motions-and-the-tangent-space) on which every iterative method below relies, and on [Filtering, normals and local features](../normals-and-local-features/), for normals and descriptors. A comprehensive review of the field is [](cite:pomerleau2015).
+
+# The registration problem
+
+Two clouds are given: a _source_ $P = \{\bfp_i\}$, the cloud to be moved, such as the newest scan, and a _target_ $Q = \{\bfq_j\}$, the cloud it is moved onto, such as the previous scan or a map. The aim is the transform $T = (R, \bft) \in \SE(3)$ that best places $P$ onto $Q$. If the clouds were exact samples of the same points, $T$ would map each $\bfp_i$ exactly onto a point of $Q$. They are not: they are different, noisy samples of the same surfaces, taken from different viewpoints, each containing parts the other lacks and, in a street, objects that moved between them. Registration methods differ in how they measure the misalignment of two such clouds, and in how they minimise it.
+
+Methods divide into _local_ ones, which refine an initial guess and converge only if it is close enough, and _global_ ones, which need no guess. In odometry a good guess is always available, from an IMU, wheel odometry or the previous motion, and local methods do nearly all the work.
+
+# Alignment with known correspondences
+
+Suppose first that it is known which point of $Q$ corresponds to each point of $P$, as pairs $(\bfp_i, \bfq_i)$, $i = 1, \dots, n$. The best transform in the least-squares sense minimises
+
+$$
+	E(R, \bft) = \sum_{i=1}^{n} \lVert R\bfp_i + \bft - \bfq_i \rVert^2, @tag(point-to-point)
+$$
+
+and despite the nonlinear constraint that $R$ be a rotation, this has a closed-form solution through one singular value decomposition, found independently by several authors [](cite:arun1987) [](cite:umeyama1991).
+
+<Statement {...kabsch} />
+
+<Proof>
+
+For a fixed $R$, $E$ is a convex quadratic in $\bft$, and setting its gradient $2\sum_i (R\bfp_i + \bft - \bfq_i)$ to zero gives $\bft = \bar\bfq - R\bar\bfp$. So the optimal translation carries the rotated centroid of $P$ onto the centroid of $Q$, and substituting it leaves a problem in $R$ alone. With the centred points $\bfp_i' = \bfp_i - \bar\bfp$ and $\bfq_i' = \bfq_i - \bar\bfq$,
+
+$$
+	E = \sum_i \lVert R\bfp_i' - \bfq_i'\rVert^2 = \sum_i \big(\lVert\bfp_i'\rVert^2 + \lVert\bfq_i'\rVert^2\big) - 2\sum_i (\bfq_i')\T R\,\bfp_i',
+$$
+
+since a rotation preserves lengths. Only the last term depends on $R$, so the problem is to maximise
+
+$$
+	\sum_i (\bfq_i')\T R\,\bfp_i' = \operatorname{tr}\Big(R \sum_i \bfp_i'(\bfq_i')\T\Big) = \operatorname{tr}(RH) = \operatorname{tr}(R U S V\T) = \operatorname{tr}(S\,V\T R U),
+$$
+
+using the cyclic property of the trace. The matrix $M = V\T R U$ is orthogonal, so each of its entries is at most $1$ in absolute value, and since $S = \operatorname{diag}(s_1, s_2, s_3)$ has non-negative entries,
+
+$$
+	\operatorname{tr}(S M) = \sum_k s_k M_{kk} \le s_1 + s_2 + s_3,
+$$
+
+with equality when $M = I$, that is, when $R = V U\T$. This is a rotation provided $\det(V U\T) = 1$. When $\det(V U\T) = -1$, the matrix $V U\T$ is a reflection, and every rotation $R$ gives an $M$ of determinant $-1$; among orthogonal matrices of determinant $-1$, the trace $\sum_k s_k M_{kk}$ is maximised by $M = \operatorname{diag}(1, 1, -1)$, which flips the axis of the smallest singular value, giving $R = V\operatorname{diag}(1, 1, -1)U\T$. Both cases are the formula stated.
+
+</Proof>
+
+The correction for reflections is not a formality: with noisy or nearly planar data the unconstrained optimum can be a reflection, and implementations that omit the determinant check occasionally return a mirror image. Computing $H$ costs $O(n)$ and the SVD of a $3 \times 3$ matrix is constant time, so the whole solution is linear in the number of pairs.
+
+```python
+def kabsch(P, Q):
+    """Rotation R and translation t minimising sum ||R p_i + t - q_i||^2 over paired rows."""
+    p_bar, q_bar = P.mean(axis=0), Q.mean(axis=0)
+    H = (P - p_bar).T @ (Q - q_bar)
+    U, S, Vt = np.linalg.svd(H)
+    D = np.diag([1.0, 1.0, np.sign(np.linalg.det(Vt.T @ U.T))])
+    R = Vt.T @ D @ U.T
+    return R, q_bar - R @ p_bar
+```
+
+Weighted pairs are handled by weighting the centroids and the terms of $H$, and [](cite:umeyama1991) extends the solution to similarity transforms, adding a scale.
+
+# Iterative Closest Point
+
+The correspondences between two LiDAR scans are not known. The _Iterative Closest Point_ algorithm (ICP) [](cite:besl1992) [](cite:chen1992) guesses them, solves for the transform as above, and repeats. Starting from an initial transform $T_0$:
+
+1. **Match.** Transform the source by the current estimate and pair each point $T_k\bfp_i$ with its nearest neighbour $\bfq_{j(i)}$ in the target, found with a k-d tree built once over $Q$.
+2. **Solve.** Find the transform that best aligns the pairs, by [%full](statement:kabsch).
+3. **Update** the estimate, and repeat until the change in the transform, or in the error, falls below a tolerance.
+
+<Icp />
+
+Each iteration decreases the error, which is why ICP converges. Matching each point to its nearest neighbour cannot increase the sum of squared distances, since every point's new partner is at least as close as its old one; and re-solving for the transform with the pairs fixed cannot increase it either, since the closed form is optimal for those pairs. The error is bounded below by zero, so it converges [](cite:besl1992). What it converges to is a _local_ minimum, the one whose basin contains the initial guess. If the guess is far off, the nearest neighbours are mostly wrong, and the algorithm can settle confidently on a misalignment: a corridor shifted by one doorway, a car aligned to the car parked behind it. In practice point-to-point ICP is reliable from initial errors of perhaps a few tenths of a metre and a few degrees, depending on the structure of the scene, and well beyond that it needs help from a better guess or from global registration.
+
+Each iteration costs $O(N \log M)$ for the nearest-neighbour queries of $N$ source points in a target of $M$ points, which dominate, and ICP typically needs ten to fifty iterations.
+
+## ICP in practice
+
+The basic algorithm is rarely used unmodified. Rusinkiewicz and Levoy [](cite:rusinkiewicz2001) divided the design of ICP into stages, each with several options, and the choices made at each matter more than the choice of algorithm.
+
+- **Selection.** Use a subset of the source points, by voxel downsampling or random sampling, or by choosing points that constrain the alignment well, such as those with diverse normals.
+- **Matching.** Nearest neighbours in a k-d tree are the default. On organised scans, _projective association_ pairs each source point with the target point in the same pixel after projecting it into the target's range image, which is much faster and nearly as good once the alignment is close.
+- **Rejection.** Discard pairs farther apart than a _maximum correspondence distance_, since a source point with no true counterpart in the target, such as a point on a car that has since driven away or on a region the target never saw, otherwise drags the solution towards its nearest, wrong, partner. Common refinements reject pairs whose normals disagree, or the worst fraction of pairs (_trimmed ICP_). The maximum distance is often decreased over the iterations, starting large to allow big corrections and ending small for precision.
+- **Weighting.** Rather than reject pairs outright, weight them by a _robust kernel_ $\rho$, replacing $\sum_i r_i^2$ by $\sum_i \rho(r_i)$ for residuals $r_i$. Huber's kernel is quadratic for small residuals and linear for large ones; Cauchy's and Geman–McClure's flatten out, so that gross outliers have almost no influence. Such a cost is minimised by _iteratively reweighted least squares_: each pair is given the weight $w_i = \rho'(r_i)/r_i$ computed from the current residuals, the weighted closed form is solved, and the weights are recomputed.
+- **Error metric.** Distances between points, as above, or distances from points to planes, as in the next section.
+
+The KISS-ICP odometry system [](cite:vizzo2023) shows how far careful choices go: point-to-point ICP with voxel-downsampled scans, a voxel-hash local map, deskewing by a constant-velocity model, a robust kernel, and a maximum correspondence distance adapted to the observed motion, with almost no other parameters, performs on par with far more elaborate systems across many sensors and platforms.
+
+# Point-to-plane ICP
+
+Two scans of the same surface do not sample the same points, so even at perfect alignment a source point sits some way from its nearest target point, typically about half the target's point spacing. Point-to-point ICP penalises this sliding offset and is slowed by it: on a planar region, the pairs pull the source towards the particular target samples rather than letting it slide freely along the plane. Chen and Medioni [](cite:chen1992) proposed measuring instead the distance from each source point to the _tangent plane_ of its target partner, using the target's normal $\bfn_i$:
+
+$$
+	E(R, \bft) = \sum_{i=1}^{n} \big( (R\bfp_i + \bft - \bfq_i)\cdot\bfn_i \big)^2. @tag(point-to-plane)
+$$
+
+A source point anywhere on the right plane now has zero error, and the error measures only the misalignment across surfaces, which is what matters. Point-to-plane ICP converges in far fewer iterations than point-to-point, often a handful rather than dozens, and is the default in most LiDAR pipelines.
+
+[](eq:point-to-plane) has no closed-form minimiser, but it is easily linearised. Write the update as a small rotation vector $\bfomega$ and translation $\bft$ applied to the current, already transformed, source points. By the [small-angle approximation](../frames-and-transforms/#small-motions-and-the-tangent-space), $R\bfp_i \approx \bfp_i + \bfomega \times \bfp_i$, and since $(\bfomega \times \bfp_i)\cdot\bfn_i = \bfomega \cdot (\bfp_i \times \bfn_i)$, each residual becomes linear in the six unknowns:
+
+$$
+	(R\bfp_i + \bft - \bfq_i)\cdot\bfn_i \approx (\bfp_i \times \bfn_i)\T\bfomega + \bfn_i\T\bft + (\bfp_i - \bfq_i)\cdot\bfn_i.
+$$
+
+Stacking the rows $\bfa_i = (\bfp_i \times \bfn_i,\ \bfn_i) \in \bbR^6$ and the right-hand sides $b_i = -(\bfp_i - \bfq_i)\cdot\bfn_i$, the update $\bfx = (\bfomega, \bft)$ solves the $6 \times 6$ normal equations
+
+$$
+	\Big(\sum_i \bfa_i\bfa_i\T\Big)\,\bfx = \sum_i \bfa_i b_i, @tag(normal-equations)
+$$
+
+after which the transform is updated through the exponential map and the correspondences are recomputed.
+
+```python
+def point_to_plane_step(P, Q, N):
+    """One Gauss-Newton step: (omega, t) for paired source P, target Q, target normals N."""
+    A = np.hstack([np.cross(P, N), N])               # (n, 6)
+    b = -np.einsum('ij,ij->i', P - Q, N)             # (n,)
+    x = np.linalg.solve(A.T @ A, A.T @ b)
+    return x[:3], x[3:]
+```
+
+## Degeneracy
+
+The matrix $A\T A = \sum_i \bfa_i\bfa_i\T$ in [](eq:normal-equations) is the Gauss–Newton approximation of the cost's Hessian, and its eigenvalues say how well each direction of motion is constrained by the scene. In a long featureless tunnel or corridor, or on an open road with nothing but the ground, every normal is perpendicular to the direction of travel, motion along it does not change any residual, and $A\T A$ has an eigenvalue near zero whose eigenvector is that motion. The solution along it is then determined by noise. Inspecting the smallest eigenvalues of $A\T A$ detects such _degeneracy_, and robust systems respond by constraining the degenerate directions with another sensor, such as wheel odometry or an IMU, rather than trusting the LiDAR there. The inverse of $A\T A$, scaled by the variance of the residuals, also gives an approximate covariance of the estimated transform, which a SLAM back end or a filter needs in order to weigh it against other information.
+
+# Generalized-ICP
+
+_Generalized-ICP_ (GICP) [](cite:segal2009) puts point-to-point and point-to-plane ICP into one probabilistic model. Each point is treated as a Gaussian sample with covariance $C$ describing the local surface, and for a correspondence $(\bfp_i, \bfq_i)$ the residual $\bfd_i = \bfq_i - (R\bfp_i + \bft)$ has covariance $C^Q_i + R\,C^P_i R\T$. The transform maximises the likelihood of the residuals, minimising
+
+$$
+	\sum_i \bfd_i\T \big(C^Q_i + R\,C^P_i R\T\big)^{-1} \bfd_i.
+$$
+
+With $C^P_i = 0$ and $C^Q_i = I$ this is point-to-point ICP; with $C^P_i = 0$ and $C^Q_i$ the projection onto the normal, it is point-to-plane. GICP's own choice models both clouds as locally planar: each covariance is computed from the point's neighbourhood and then replaced by $\operatorname{diag}(\epsilon, 1, 1)$ in the frame of its eigenvectors, with a small $\epsilon$ along the normal. The resulting _plane-to-plane_ metric penalises misalignment only across the surfaces of both clouds, and it is more accurate and more robust to the choice of correspondence distance than either special case. It is minimised by an iterative nonlinear solver, and its fast implementations are among the most widely used registration methods in LiDAR odometry.
+
+# The Normal Distributions Transform
+
+The _Normal Distributions Transform_ (NDT) [](cite:biber2003) avoids point correspondences altogether. The target is divided into voxels, and the points in each voxel are summarised by their mean $\bfmu_k$ and covariance $\Sigma_k$, turning the cloud into a piecewise-smooth density, a mixture of Gaussians. The source is then scored by how probable its transformed points are under that density,
+
+$$
+	s(R, \bft) = \sum_i \exp\Big(-\tfrac{1}{2}\,(R\bfp_i + \bft - \bfmu_{k(i)})\T\,\Sigma_{k(i)}^{-1}\,(R\bfp_i + \bft - \bfmu_{k(i)})\Big),
+$$
+
+where $k(i)$ is the voxel the transformed point falls in, and the score is maximised by Newton's method with analytic derivatives. Because the target is summarised once and each source point needs only a voxel lookup, NDT is fast and its cost does not grow with the density of the target, which made it the standard method for localising against large prior maps; the open-source driving stack Autoware uses it for exactly that. Its accuracy and basin of convergence depend on the voxel size, and coarse-to-fine schedules over several voxel sizes are common.
+
+# Global registration
+
+When no initial guess is available, for example when relocalising a vehicle whose position is lost, aligning scans from independent sessions, or closing a loop after long drift, local methods cannot be used and the alignment must be found from the clouds alone. The standard pipeline combines the descriptors of [Filtering, normals and local features](../normals-and-local-features/#keypoints-and-descriptors) with [RANSAC](../ransac-and-ground-segmentation/#ransac).
+
+1. Downsample both clouds and compute normals and FPFH descriptors.
+2. Match each source descriptor to its nearest target descriptor, keeping mutual matches. These putative correspondences are mostly outliers.
+3. Run RANSAC over the matches: sample three correspondences, compute the transform that aligns them by [%full](statement:kabsch), and count the correspondences it maps within a threshold. Cheap checks reject a sample before the transform is computed, for instance if the distances between its three source points differ from those between its three target points, since a rigid motion preserves distances.
+4. Refine the best transform by ICP.
+
+With inlier ratios of a few percent, RANSAC needs many thousands of samples, so faster alternatives are an active area. Methods that optimise a robust cost over all correspondences at once, with a schedule that gradually tightens the kernel, avoid sampling altogether; others prune correspondences with pairwise consistency graphs or come with certificates that the solution is globally optimal; and learned descriptors raise the inlier ratio to begin with. In driving, the more common source of a global guess is place recognition, which first identifies which part of a map a scan was taken in, as the writeup on SLAM describes.
+
+# Evaluating a registration
+
+Two numbers are standard. The _fitness_ is the fraction of source points that have a target point within the correspondence threshold after alignment, and measures overlap; the _inlier RMSE_ is the root mean square distance over those pairs, and measures precision. A registration with high fitness and low RMSE is probably right; a high RMSE suggests a poor local minimum or a poor initial guess; a low fitness may mean only that the clouds overlap little, which itself makes the result less trustworthy. Neither number detects a confidently wrong alignment in a repetitive or degenerate scene, which is why the eigenvalues of the Hessian, consistency with odometry from other sensors, and checks over time are used as well.
+
+# Summary
+
+With correspondences known, the best rigid alignment is given in closed form by an SVD, [%full](statement:kabsch). ICP alternates between guessing correspondences by nearest neighbours and solving that problem, converging monotonically to a local minimum near its initial guess. Point-to-plane ICP, which linearises the rotation and solves a $6 \times 6$ system [](eq:normal-equations) per iteration, converges much faster on the planar surfaces of built environments, and the eigenvalues of that system reveal degenerate directions. GICP and NDT model the clouds as Gaussians, plane-to-plane and voxel by voxel. Global registration matches descriptors under RANSAC and hands the result to ICP. The next writeup assembles registration into a full odometry and mapping system.

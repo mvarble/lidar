@@ -1,0 +1,1 @@
+Aligning one point cloud to another: the closed-form Kabsch–Umeyama solution for known correspondences, ICP and the practical choices that make it work, point-to-plane ICP and degeneracy, Generalized-ICP, NDT, and global registration with descriptors and RANSAC.
