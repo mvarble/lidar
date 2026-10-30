@@ -1,0 +1,1 @@
+Tracking by detection: the Kalman filter and the motion models used for road users, gating by Mahalanobis distance, optimal assignment by the Hungarian algorithm, track management, LiDAR-specific difficulties, and the MOTA family of metrics.

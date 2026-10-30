@@ -1,0 +1,135 @@
+---
+title: Multi-object tracking
+created: 2026-10-30
+depends_on: [clustering-and-bounding-boxes]
+katex_macros:
+    '\hatx': '\hat{\bfx}'
+---
+
+<script>
+    import Kalman from './Kalman.svelte';
+</script>
+
+A detector, whether the clustering of an earlier writeup or the networks of the next one, reports the objects in each scan independently: a list of boxes, each a snapshot with no memory of the scan before. Driving needs more. A planner must know that the car ahead is the same car it saw a moment ago, how fast it is moving and where it will be in two seconds; it must not brake for a phantom that appears in one scan, nor forget a pedestrian who is hidden behind a parked van for half a second. _Multi-object tracking_ (MOT) provides this by maintaining a set of _tracks_, each an object with an identity, a state such as position, velocity, heading and size, and an uncertainty, and updating them as detections arrive. This writeup describes _tracking by detection_, the paradigm used in nearly every LiDAR system: the Kalman filter that estimates each track's state, the data association that decides which detection belongs to which track, the management of tracks as objects appear and disappear, and the metrics by which trackers are compared.
+
+This writeup builds on [Clustering and bounding boxes](../clustering-and-bounding-boxes/), whose oriented boxes, and their bias from partial views, are what a tracker receives, and on [LiDAR odometry and SLAM](../lidar-odometry-and-slam/), whose estimate of the ego vehicle's own motion lets tracks be kept in a fixed frame.
+
+# The structure of a tracker
+
+Each time a scan's detections arrive, a tracker performs four steps.
+
+1. **Predict** every existing track forward to the time of the scan with a motion model.
+2. **Associate** detections with tracks: decide which detection, if any, is a new observation of each track.
+3. **Update** each matched track's state with its detection.
+4. **Manage** the tracks: start tentative tracks from unmatched detections, confirm tentative tracks that keep being matched, and delete tracks that have gone unmatched for too long.
+
+The vehicle carrying the sensor moves too, so detections are first transformed into a fixed frame, such as the odometry frame, using the ego pose at the time of the scan. Otherwise every parked car would appear to move at the vehicle's own speed, and the motion models below would have to explain the ego vehicle's manoeuvres as well as the objects'.
+
+# The Kalman filter
+
+The state of a track is estimated by a _Kalman filter_ [](cite:kalman1960), the optimal estimator for a linear system with Gaussian noise. It represents its belief about the state $\bfx$ as a Gaussian with mean $\hatx$ and covariance $P$, and assumes that the state evolves and is observed as
+
+$$
+	\bfx_k = F\bfx_{k-1} + \bfw_k, \qquad \bfz_k = H\bfx_k + \bfv_k, \qquad \bfw_k \sim \mathcal{N}(0, Q), \quad \bfv_k \sim \mathcal{N}(0, R),
+$$
+
+where $F$ is the motion model, $H$ the measurement model, $Q$ the _process noise_ covering everything the motion model leaves out, and $R$ the measurement noise. The filter alternates two steps. Prediction carries the belief forward through the motion model, and its uncertainty grows:
+
+$$
+	\hatx_k^- = F\hatx_{k-1}, \qquad P_k^- = F P_{k-1} F\T + Q. @tag(predict)
+$$
+
+Update corrects the prediction with the measurement. The _innovation_ $\bfnu_k = \bfz_k - H\hatx_k^-$ is the surprise in the measurement, and its covariance is $S_k = H P_k^- H\T + R$. The _Kalman gain_ $K_k = P_k^- H\T S_k^{-1}$ decides how much of the surprise to believe, weighing the prediction's uncertainty against the measurement's, and
+
+$$
+	\hatx_k = \hatx_k^- + K_k\bfnu_k, \qquad P_k = (I - K_k H)P_k^-. @tag(update)
+$$
+
+A precise measurement or an uncertain prediction gives a gain near the identity, so the estimate follows the measurement; an imprecise measurement or a confident prediction gives a small gain, so the estimate stays near the prediction. The filter thus averages measurements over time in exactly the proportion their noise warrants, and it estimates quantities, such as velocity, that are never measured directly but are revealed by how the measured position changes.
+
+## Motion models
+
+The simplest useful model for objects on a road is _constant velocity_ in the bird's-eye view, with the state $\bfx = (x, y, v_x, v_y)$ and, over a time step $\Delta t$,
+
+$$
+	F = \begin{pmatrix} 1 & 0 & \Delta t & 0 \\ 0 & 1 & 0 & \Delta t \\ 0 & 0 & 1 & 0 \\ 0 & 0 & 0 & 1 \end{pmatrix}, \qquad
+	H = \begin{pmatrix} 1 & 0 & 0 & 0 \\ 0 & 1 & 0 & 0 \end{pmatrix}.
+$$
+
+Real objects accelerate, and the model accounts for this through $Q$. Treating acceleration as white noise of variance $\sigma_a^2$ gives, for each axis's position and velocity, the block
+
+$$
+	Q_{\text{axis}} = \sigma_a^2 \begin{pmatrix} \Delta t^4/4 & \Delta t^3/2 \\ \Delta t^3/2 & \Delta t^2 \end{pmatrix},
+$$
+
+and $\sigma_a$ is the parameter to tune: small for smooth estimates of steady traffic, large to keep up with manoeuvres. The figure shows the trade on a braking car. Full trackers add the box's size, heading and height to the state, the size usually with no dynamics at all.
+
+<Kalman />
+
+Vehicles do not slide sideways, and a model that knows this predicts turns far better. The _constant turn rate and velocity_ (CTRV) model has state $(x, y, \theta, v, \omega)$, a heading and speed and a yaw rate, and moves the object along a circular arc. It is nonlinear, so it is used with an _extended Kalman filter_ (EKF), which linearises the motion and measurement models about the current estimate at each step, or an _unscented Kalman filter_ (UKF), which propagates a small set of deterministically chosen sample points through the nonlinear model instead. Since no single model fits a vehicle that sometimes cruises and sometimes turns, an _interacting multiple model_ (IMM) filter runs several models at once and mixes their estimates according to how well each has recently explained the measurements.
+
+# Data association
+
+Before a detection can update a track, the tracker must decide which track it belongs to. With objects far apart this is trivial; in dense traffic, at junctions and in crowds, it is the hardest part of tracking, and errors here, swapping the identities of two pedestrians, are the most damaging.
+
+## Gating
+
+The innovation covariance $S$ says where the track expects its next measurement to fall. The _Mahalanobis distance_ of a detection from the prediction,
+
+$$
+	d^2 = \bfnu\T S^{-1} \bfnu,
+$$
+
+follows a $\chi^2$ distribution with as many degrees of freedom as the measurement has dimensions, if the detection really belongs to the track. A _gate_ $d^2 < \gamma$ therefore rules out detections that are implausible for the track, with $\gamma$ chosen from the $\chi^2$ table: $\gamma = 9.21$ keeps $99\%$ of true detections of a two-dimensional position. Gating removes most candidate pairs before any optimisation and adapts automatically to each track's uncertainty, so that a track that has not been seen for a while, whose covariance has grown, accepts detections from a wider area.
+
+## Assignment
+
+The remaining candidate pairs are scored by a cost, such as the Mahalanobis distance, the Euclidean distance between centres, or one minus the overlap of the boxes measured by their intersection over union (IoU) in the bird's-eye view, giving a matrix $C$ with a row for each track and a column for each detection, and infinite cost for gated-out pairs. Associating each track with at most one detection and each detection with at most one track, at least total cost, is the _linear assignment problem_:
+
+$$
+	\min_{\pi} \sum_{i} C_{i, \pi(i)}, \qquad \pi \text{ a one-to-one matching of tracks to detections.}
+$$
+
+It is solved exactly by the _Hungarian algorithm_ [](cite:kuhn1955) in $O(n^3)$ time for $n$ tracks and detections. The algorithm works with potentials on the rows and columns that keep every reduced cost $C_{ij} - u_i - v_j$ non-negative, and repeatedly finds a shortest augmenting path in the graph of zero reduced costs, adjusting the potentials when none exists, until every row is matched. In practice it is called from a library, such as `scipy.optimize.linear_sum_assignment`, and pairs whose cost exceeds the gate are discarded from its result.
+
+```python
+from scipy.optimize import linear_sum_assignment
+
+def associate(cost, gate):
+    """Optimal one-to-one matching of tracks (rows) to detections (columns) under a gate."""
+    cost = np.where(cost < gate, cost, 1e9)
+    rows, cols = linear_sum_assignment(cost)
+    keep = cost[rows, cols] < gate
+    matches = list(zip(rows[keep], cols[keep]))
+    unmatched_tracks = set(range(cost.shape[0])) - set(rows[keep])
+    unmatched_dets = set(range(cost.shape[1])) - set(cols[keep])
+    return matches, unmatched_tracks, unmatched_dets
+```
+
+A _greedy_ alternative repeatedly takes the cheapest remaining pair. It is not optimal but is simpler and faster, and when the prediction is good it loses little; CenterPoint [](cite:yin2021), for example, tracks by greedily matching each detection's centre, moved back in time by the velocity its network predicts, to the nearest track.
+
+Methods that consider association more carefully exist for dense, ambiguous scenes. _Joint probabilistic data association_ (JPDA) updates each track with a weighted average over all detections in its gate, weighted by the probability of each association; _multiple hypothesis tracking_ (MHT) keeps several alternative association histories and decides between them later, when more evidence has arrived; and trackers based on _random finite sets_ treat the set of objects itself as the random variable. They are more robust and considerably more expensive.
+
+# Track management
+
+Detections include false positives and miss true objects, so tracks are not created and destroyed on single detections. An unmatched detection starts a _tentative_ track, which is _confirmed_ and reported only after it has been matched in, say, three of the next five scans, so that a one-off false detection never reaches the planner. A confirmed track that goes unmatched is not deleted at once but _coasted_: predicted forward without updates, its covariance growing, so that an object briefly hidden behind another or missed by the detector keeps its identity when it reappears. Only after several consecutive misses, more for well-established tracks than for new ones, is it deleted.
+
+This simple scheme, a Kalman filter per track, gating, Hungarian assignment and count-based management, is the whole of SORT [](cite:bewley2016), designed for camera detections, and of its three-dimensional counterpart AB3DMOT [](cite:weng2020), which tracks LiDAR boxes with a constant-velocity filter and assignment on 3D IoU. Both showed that with a strong detector this baseline is hard to beat, and it is the right answer to the interview question "how would you build a tracker?".
+
+## Practical difficulties
+
+Several problems are particular to LiDAR. Box headings are often ambiguous by $180°$, since a car's front and back look alike in a sparse cluster, and an unhandled flip turns a car driving away into one reversing at speed; trackers compare the detected heading with the track's direction of motion and flip it when they disagree. Boxes from clusters are biased towards the sensor, because only the near faces of an object are seen, and the bias changes as the vehicle passes the object, which a tracker misreads as motion unless it tracks a reference point that stays put, such as the visible corner, or keeps a size estimate that only grows. And the motion distortion of a scan, which deskewing removes for the static world, remains for moving objects, which a tracker running at the scan rate must tolerate.
+
+# Evaluation
+
+Trackers are scored against ground-truth tracks, by matching estimated to true objects in each frame and counting the errors. The longest-standing summary is the _multiple object tracking accuracy_,
+
+$$
+	\mathrm{MOTA} = 1 - \frac{\sum_t (\mathrm{FN}_t + \mathrm{FP}_t + \mathrm{IDSW}_t)}{\sum_t \mathrm{GT}_t},
+$$
+
+which counts missed objects (false negatives), phantom tracks (false positives) and identity switches against the number of true objects, accompanied by the _multiple object tracking precision_ (MOTP), the average distance between matched pairs. MOTA depends strongly on the detector's confidence threshold, so the nuScenes benchmark [](cite:caesar2020) reports AMOTA, which averages a recall-normalised MOTA over many thresholds. More recent metrics such as HOTA weigh detection quality and association quality more evenly, since MOTA is dominated by detection errors and barely notices identity switches.
+
+# Summary
+
+A tracker predicts each track with a motion model, associates detections to tracks, updates the matched tracks, and manages their lifecycle. The Kalman filter's prediction [](eq:predict) and update [](eq:update) estimate position and velocity optimally for linear Gaussian models, with EKFs and UKFs for the nonlinear models of turning vehicles. Mahalanobis gating rules out implausible pairs, and the Hungarian algorithm finds the best one-to-one assignment of the rest. Tentative tracks, coasting and deletion after repeated misses absorb the detector's errors. The final writeup of the course turns to the detectors that now provide those detections: deep networks that learn to find objects in point clouds.
