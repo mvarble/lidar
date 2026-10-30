@@ -235,6 +235,12 @@ $$
 
 In a real sensor the channels do not all emit from the same point, so the manufacturer's calibration also gives each channel small horizontal and vertical offsets, and an azimuth correction, that are applied in the same conversion. Computing [](eq:spherical) is the first step of every LiDAR driver.
 
+## The ring index
+
+The channel index $i$ is usually stored with each point under the name _ring_. It is an integer from $0$ to $N - 1$ saying which of the sensor's $N$ lasers produced the point. The name comes from what a channel draws: as the head spins, each laser sweeps a cone of fixed elevation $\theta_i$, which meets flat ground in a circle round the sensor, so the points of one channel form one ring in the bird's-eye view of the scan, as in the figure below. The ring is not the radius. Points on one ring lie at every distance, wherever the cone happens to meet a surface: on the ground at $h / \tan|\theta_i|$, on a car much nearer, on a wall farther away.
+
+It may seem that the ring could be recomputed from the coordinates, since by [](eq:spherical) the elevation of a point is $\arcsin(z / r)$, and that should identify the channel. In practice this fails, which is why sensors report the ring explicitly. Adjacent channels may be only a few tenths of a degree apart, and the per-channel offsets mean that a channel's points do not all lie at exactly the elevation $\theta_i$ seen from the origin; a sensor mounted with a tilt, or a cloud already transformed into the vehicle's frame, scrambles elevations altogether; and range noise blurs the computed angle of near points. The ring is a fact about how the point was measured, recorded at the moment of measurement, and much processing relies on it: it is the row of the range image, it defines the scan lines along which the LOAM odometry of a later writeup extracts its features, it lets ground segmentation compare each point with the one measured by the channel below it, and it selects the per-channel calibration applied to intensity. Drivers disagree on its direction (ROS's Velodyne driver numbers rings from the lowest beam upwards, while Ouster numbers its beams from the top down), so the convention must be checked for each sensor.
+
 ## Range images and point clouds
 
 The measurements of one revolution, a _scan_ or _sweep_ or _frame_, can be stored in two equivalent ways, and practitioners move between them constantly.
