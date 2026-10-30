@@ -1,0 +1,95 @@
+---
+title: Clustering and bounding boxes
+created: 2026-10-30
+depends_on: [ransac-and-ground-segmentation]
+---
+
+<script>
+    import LShape from './LShape.svelte';
+</script>
+
+Once the ground has been removed from a scan, what remains is a scattering of points on cars, people, poles, walls and vegetation, and the natural next step is to group the points into objects. Clustering does this without any notion of what the objects are: it relies only on the fact that points on one object lie close together and points on different objects, with the ground gone, usually do not. Each cluster is then summarised by a bounding box or a polygon, which a tracker can follow and a planner can avoid. This writeup describes the clustering methods used on LiDAR, Euclidean clustering, grid-based connected components, DBSCAN and range-image segmentation, and then the fitting of bounding boxes to clusters, which is harder than it looks because the sensor sees only one side of each object.
+
+Learned detectors, the subject of a later writeup, now produce most object detections in driving systems, but clustering survives in every production stack alongside them. It finds obstacles of kinds the detector was never trained on, such as debris, fallen branches and unusual vehicles, and a system that must never drive into an object cannot rely on having seen its class before. This writeup builds on [RANSAC and ground segmentation](../ransac-and-ground-segmentation/), since clustering works on the non-ground points, and on the neighbour queries of [Spatial data structures and neighbour search](../neighbour-search/).
+
+# Euclidean clustering
+
+The simplest definition of an object is a set of points that can be connected by hops shorter than some distance $\varepsilon$. Formally, consider the graph whose vertices are the points and whose edges join every pair closer than $\varepsilon$. The clusters are its _connected components_. This is _Euclidean cluster extraction_, as PCL calls it, and it is also known as single-linkage clustering cut at height $\varepsilon$.
+
+The components are found by breadth-first search: take an unvisited point, start a new cluster, and repeatedly add the unvisited neighbours within $\varepsilon$ of points in the cluster, found with radius queries on a k-d tree, until none remain.
+
+```python
+from collections import deque
+
+def euclidean_clusters(points, tree, eps=0.5, min_size=10, max_size=50_000):
+    """Connected components of the eps-neighbourhood graph (tree: scipy cKDTree)."""
+    labels = np.full(len(points), -1)
+    cluster = 0
+    for seed in range(len(points)):
+        if labels[seed] != -1:
+            continue
+        labels[seed] = cluster
+        queue, members = deque([seed]), [seed]
+        while queue:
+            for j in tree.query_ball_point(points[queue.popleft()], eps):
+                if labels[j] == -1:
+                    labels[j] = cluster
+                    queue.append(j)
+                    members.append(j)
+        if not min_size <= len(members) <= max_size:
+            labels[members] = -2                      # rejected: noise or too large
+        cluster += 1
+    return labels
+```
+
+The cost is $N$ radius queries, about $O(N \log N)$ plus the number of neighbour pairs. The minimum size discards clusters of a few points, which are usually noise, and the maximum discards huge ones, usually buildings or remnants of the ground.
+
+The choice of $\varepsilon$ is the method's whole difficulty, and on LiDAR data it has no right value. Too small, and a sparsely sampled object far from the sensor, whose points may be half a metre apart, falls into many fragments, _over-segmentation_. Too large, and a pedestrian standing beside a car, or two cars parked nose to tail, merge into one cluster, _under-segmentation_. Because the spacing of points grows in proportion to range, as [How LiDAR works](../how-lidar-works/#sampling-density) shows, implementations often let $\varepsilon$ grow with the distance of the points from the sensor, or cluster separately in rings of range with different thresholds.
+
+# Connected components on a grid
+
+A faster approximation trades the exact distance threshold for a grid. The non-ground points are binned into a bird's-eye grid of cells, a few tens of centimetres across, and a cell is marked occupied if it holds any points (or, more robustly, more than a few). The clusters are then the connected components of the occupied cells, under either 4- or 8-connectivity, found by the classic two-pass _connected-component labelling_ algorithm of image processing with a union–find structure to merge provisional labels. This costs $O(N)$ plus the size of the grid, runs in a millisecond or two, and is easy to put on a GPU, which is why grid-based clustering is common in production systems. Its resolution sets the effective $\varepsilon$, and it cannot separate objects stacked vertically, such as a person standing under a tree, unless the cells also record the heights they contain. The same idea in three dimensions, connected components of occupied voxels under 26-connectivity, separates objects at different heights at the cost of a larger grid.
+
+# DBSCAN
+
+_DBSCAN_ (density-based spatial clustering of applications with noise) [](cite:ester1996) adds a notion of density to Euclidean clustering so that sparse noise does not bridge separate objects. It has two parameters, a radius $\varepsilon$ and a count $m$. A point with at least $m$ points (itself included) within $\varepsilon$ is a _core_ point. A point that is not core but lies within $\varepsilon$ of a core point is a _border_ point. All other points are _noise_. Clusters are the connected components of the core points under the $\varepsilon$-neighbourhood relation, with each border point attached to a cluster of a core point near it.
+
+Two consequences matter. A thin bridge of noise points between two objects no longer joins them, because the noise points are not core points and connectivity passes only through core points; and isolated points are labelled noise rather than forced into clusters. With $m = 1$ every point is core, and DBSCAN reduces exactly to Euclidean clustering. Its cost, with a spatial index, is again about $O(N \log N)$. Its weakness on LiDAR is the same as Euclidean clustering's: a single density threshold $m$ within $\varepsilon$ cannot suit both the dense near field and the sparse far field, so that distant objects become noise. HDBSCAN, a hierarchical variant, chooses a density level per cluster rather than one for all, and handles varying density better.
+
+# Clustering in the range image
+
+The fastest clustering methods work in the range image, where every point's neighbours are the adjacent pixels. Bogoslavskyi and Stachniss [](cite:bogoslavskyi2016) decide whether two neighbouring pixels belong to the same object by an angle rather than a distance, which makes the decision independent of range. Let two neighbouring beams, separated by the angle $\psi$ between their directions (the azimuth step for horizontal neighbours, the elevation step for vertical ones), measure ranges $d_1 \ge d_2$. Consider the triangle formed by the sensor and the two points; the angle at the farther point, between its beam and the segment joining it to the nearer point, is
+
+$$
+	\beta = \operatorname{atan2}\big(d_2 \sin\psi,\ d_1 - d_2\cos\psi\big).
+$$
+
+If the two points lie on one surface facing the sensor, the segment between them is roughly perpendicular to the beams, $d_1 \approx d_2$, and $\beta$ is large. If the nearer point is on the edge of a foreground object and the farther one on the background, $d_1 \gg d_2$, the segment between them runs almost along the beam, and $\beta$ is small. Pixels are joined when $\beta$ exceeds a threshold, around $10°$, and the clusters are found by breadth-first search over the image. Because the test is an angle, a far-away car whose points are a metre apart is still joined, while a pedestrian a metre in front of a wall is still separated. Running directly on the image with no tree to build, this segments a 64-beam scan in a few milliseconds on a single core.
+
+# Over- and under-segmentation
+
+Every geometric clustering method makes characteristic errors, and post-processing aims at them. An object partly hidden behind a pole or a tree is split by the occluder's shadow into two clusters, which merging rules may rejoin if they are close and their combined extent is plausible for an object. Pedestrians walking in a group, a cyclist beside a parked car, or a car under a tree's overhanging branches are merged into one cluster, which may be split again by looking for gaps in the cluster's height profile or for several local maxima of point density. The best remedy is often the tracker downstream, which knows from previous frames how many objects there were.
+
+# Bounding boxes
+
+A cluster is summarised for downstream use by a geometric primitive: an axis-aligned box, an oriented box, or a polygon. Driving systems mostly use oriented boxes in the bird's-eye view, described by a centre $(x, y)$, a size $(l, w)$ and a heading $\theta$, extended upwards from the ground to the cluster's highest point. The vertical extent is easy; the difficulty is the heading and the horizontal size.
+
+## Boxes by PCA
+
+The obvious estimate of an object's heading is the principal axis of its points in the bird's-eye view, the eigenvector of the largest eigenvalue of their $2 \times 2$ covariance, with the box then fitted tightly around the points in that orientation. This works for clusters that cover an object fairly evenly, but a LiDAR sees only the faces of an object that face it. A car seen from behind and to one side yields two perpendicular lines of points, an _L-shape_, and the principal axis of an L runs along neither side but between them, so the PCA box is rotated and much too large.
+
+## L-shape fitting
+
+_L-shape fitting_ instead searches over candidate headings $\theta$ in $[0°, 90°)$, since a rectangle repeats every quarter turn. For each one it projects the points onto the axes $\bfe_1 = (\cos\theta, \sin\theta)$ and $\bfe_2 = (-\sin\theta, \cos\theta)$, takes the tightest rectangle aligned with them, and scores how well the points fit its edges. One criterion is the area of the rectangle, to be minimised; a better one for partial views is _closeness_, which rewards points for lying near an edge, as by the sum over points of the reciprocal of each point's distance to its nearest edge (clipped below so that no single point dominates). The best-scoring heading gives the box. A search over $90$ one-degree steps costs $O(90N)$, trivial for a cluster of a few hundred points.
+
+<LShape />
+
+Even a correct L-shape fit only bounds what was seen. The sides of the object facing away from the sensor were not observed, so the fitted box is too small along them and its centre is biased towards the sensor; a car seen end-on yields a single line of points, from which neither its length nor its heading can be told. Systems therefore correct box sizes with priors for each class of object, and rely on a tracker to accumulate an object's extent as it is seen from different angles.
+
+## Polygons
+
+For obstacles of no particular shape, such as a pile of debris or a hedge, a box is a poor description, and the cluster is summarised by its _convex hull_ in the bird's-eye view, the smallest convex polygon containing its points. Andrew's monotone chain algorithm computes it in $O(n \log n)$ by sorting the points by $x$ and building the lower and upper hulls with a stack. Concave hulls and occupancy grids describe shapes more faithfully at greater cost.
+
+# Summary
+
+With the ground removed, objects are connected components of nearby points. Euclidean clustering finds them with radius queries; grid-based connected-component labelling approximates it in linear time; DBSCAN keeps sparse noise from bridging objects; and range-image segmentation decides adjacency by the angle $\beta$, which is independent of range. Every method trades over-segmentation against under-segmentation, a trade made harder by LiDAR's varying density and by occlusion. Clusters are summarised by oriented boxes, whose heading is found by L-shape fitting rather than PCA because the sensor sees only one or two sides of an object. Before turning to tracking such objects over time, the course turns to the motion of the sensor itself, beginning with the registration of one scan to another.

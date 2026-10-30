@@ -1,0 +1,1 @@
+Grouping non-ground points into objects by Euclidean clustering, grid connected components, DBSCAN and range-image segmentation, and summarising each cluster by an oriented box found by L-shape fitting, or by a convex hull.
