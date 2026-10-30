@@ -1,11 +1,13 @@
 ---
 title: How LiDAR works, from photons to point clouds
 created: 2026-10-30
+updated: 2026-10-30
 ---
 
 <script>
     import Waveform from './Waveform.svelte';
     import ScanPattern from './ScanPattern.svelte';
+    import Beat from './Beat.svelte';
 </script>
 
 A LiDAR (light detection and ranging) sensor measures distance by timing light. It fires a short pulse of laser light, waits for the echo, and converts the round-trip time into a range; by steering the beam across a field of view many times a second it builds up a three-dimensional sample of its surroundings, the _point cloud_. This writeup explains how that happens: the physics of the measurement, the electronics that make it, the ways a beam is steered, and, most importantly for everything that follows in the course, the structure, density and defects of the data that comes out. Every algorithm in the later writeups is shaped by the facts established here: that the data is a sparse, irregular sample of surfaces, organised by beam and by time, that thins with distance and is riddled with occlusion shadows. A standard reference for the hardware is [](cite:mcmanamon2019).
@@ -78,15 +80,40 @@ which is why a weak echo from a distant, dark target is not only less likely to 
 
 # Frequency-modulated continuous wave
 
-Everything above concerns _pulsed_ (or _direct_) time of flight, which is what the great majority of sensors use. The main alternative, frequency-modulated continuous wave (FMCW) LiDAR, transmits continuously while sweeping its optical frequency linearly, a _chirp_ of bandwidth $B$ over a duration $T_c$. The echo is mixed with a copy of the outgoing light. Since the echo left earlier, by the round-trip time $2r/c$, its frequency differs from the current outgoing frequency by a _beat frequency_
+Everything above concerns _pulsed_ (or _direct_) time of flight, which is what the great majority of sensors use. The main alternative, frequency-modulated continuous wave (FMCW) LiDAR, does not time a pulse at all. It transmits continuously while sweeping its optical frequency linearly, a _chirp_ of bandwidth $B$ over a duration $T_c$, and it measures range as a difference of frequencies. Understanding how requires one fact about what happens when two light waves fall on the same detector.
+
+## Mixing and beat frequencies
+
+A photodetector does not respond to the electric field of light, which oscillates at about $193$ THz at a wavelength of $1550$ nm, far faster than any electronics can follow. It responds to the light's _power_, which is proportional to the square of the field, averaged over the detector's response time of a nanosecond or so. That squaring is what makes two waves interact.
+
+Suppose two waves reach the detector together: a strong wave $A\cos(\omega_1 t)$, a copy of the outgoing laser light called the _local oscillator_, and a weak echo $a\cos(\omega_2 t + \phi)$ with its own amplitude, frequency and phase. The fields add, and the detector sees the square of the sum,
+
+$$
+	\big(A\cos\omega_1 t + a\cos(\omega_2 t + \phi)\big)^2
+	= A^2\cos^2\omega_1 t + a^2\cos^2(\omega_2 t + \phi) + 2Aa\cos(\omega_1 t)\cos(\omega_2 t + \phi).
+$$
+
+The product-to-sum identity $2\cos x\cos y = \cos(x - y) + \cos(x + y)$ splits the last term in two, and $\cos^2 x = \tfrac{1}{2}(1 + \cos 2x)$ does the same for the first two. Every resulting term oscillates either at an optical frequency ($2\omega_1$, $2\omega_2$ or $\omega_1 + \omega_2$), which the detector averages to zero, or not at all, except one. What the detector reports is
+
+$$
+	\tfrac{1}{2}A^2 + \tfrac{1}{2}a^2 + Aa\cos\big((\omega_1 - \omega_2)\,t - \phi\big). @tag(beat)
+$$
+
+Nothing cancels. The two waves add, and since their frequencies differ slightly they drift steadily in and out of step: where their crests coincide the total power is high, where a crest meets a trough it is low. The power therefore swells and fades at the _difference_ of the two frequencies, the _beat frequency_, just as two tuning forks slightly out of tune produce a sound that throbs. The echo's amplitude and phase appear in [](eq:beat), but only in how deep the throb is ($Aa$) and when it peaks ($\phi$); its rate depends on the frequencies alone. The weakness of the echo is in fact turned to advantage, since the throb's depth is the echo's amplitude multiplied by the strong local oscillator's, an amplification called _heterodyne gain_. This mixing of a signal with a reference to measure their difference is _coherent_ (or _heterodyne_) detection, the same principle by which a radio receiver tunes to a station.
+
+<Beat />
+
+## Range from a chirp
+
+FMCW applies this to a chirp. The outgoing light's frequency rises at the steady rate $B / T_c$. The echo arriving now left the sensor one round-trip time $2r/c$ ago, when the frequency was lower by $(B / T_c)(2r/c)$. Both waves are rising at the same rate, so this difference stays constant through the chirp, and mixing the echo with the current outgoing light gives a beat at
 
 $$
 	f_b = \frac{B}{T_c} \cdot \frac{2r}{c},
 $$
 
-which is low enough (megahertz) to measure precisely, and which gives the range. If the target moves along the beam at radial velocity $v$, the echo is also Doppler-shifted by $f_D = 2v / \lambda$, which is $1.29$ MHz for every metre per second at $\lambda = 1550$ nm. Alternating rising and falling chirps separates the two effects, since the Doppler shift adds to the beat frequency on one and subtracts on the other.
+which is proportional to the range. A chirp of $B = 1$ GHz over $T_c = 10\ \mu$s and a target at $150$ m give $f_b = 100$ MHz: far below the optical frequencies, and easily measured by digitising the detector's output and taking its Fourier transform, in which each target along the beam appears as a peak. If the target moves along the beam at radial velocity $v$, the echo is also Doppler-shifted by $f_D = 2v / \lambda$, which is $1.29$ MHz for every metre per second at $\lambda = 1550$ nm. Alternating rising and falling chirps separates the two effects, since the Doppler shift adds to the beat frequency on one and subtracts on the other.
 
-FMCW therefore measures the radial velocity of every point directly, which a pulsed sensor can only infer by comparing successive frames, and its coherent detection rejects sunlight and the pulses of other LiDARs. Its range resolution is set by the chirp bandwidth, $\Delta r = c / (2B)$, so $1$ GHz gives $15$ cm. The cost is the complexity of a narrow-linewidth laser and coherent optics, and FMCW sensors usually work at 1550 nm.
+FMCW therefore measures the radial velocity of every point directly, which a pulsed sensor can only infer by comparing successive frames, and its coherent detection rejects sunlight and the pulses of other LiDARs, since light that is not at almost exactly the local oscillator's frequency produces a beat far outside the band the receiver listens to. Its range resolution is set by the chirp bandwidth, $\Delta r = c / (2B)$, so $1$ GHz gives $15$ cm. The cost is the complexity of a narrow-linewidth laser and coherent optics, and FMCW sensors usually work at 1550 nm.
 
 # Steering the beam
 
