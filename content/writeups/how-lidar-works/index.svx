@@ -101,6 +101,8 @@ $$
 
 Nothing cancels. The two waves add, and since their frequencies differ slightly they drift steadily in and out of step: where their crests coincide the total power is high, where a crest meets a trough it is low. The power therefore swells and fades at the _difference_ of the two frequencies, the _beat frequency_, just as two tuning forks slightly out of tune produce a sound that throbs. The echo's amplitude and phase appear in [](eq:beat), but only in how deep the throb is ($Aa$) and when it peaks ($\phi$); its rate depends on the frequencies alone. The weakness of the echo is in fact turned to advantage, since the throb's depth is the echo's amplitude multiplied by the strong local oscillator's, an amplification called _heterodyne gain_. This mixing of a signal with a reference to measure their difference is _coherent_ (or _heterodyne_) detection, the same principle by which a radio receiver tunes to a station.
 
+The figure below lets the echo's amplitude and phase be chosen and shows their effect. It describes each wave by a _phasor_, an arrow whose length is the wave's amplitude and whose angle is its phase, so that the echo $a\cos(\omega_2 t + \phi)$ is the arrow $a e^{\rmi\phi}$ drawn against the local oscillator's arrow $A$ along the horizontal axis. Adding two waves of the same frequency is adding their arrows. Two waves of slightly different frequencies are like two arrows turning at slightly different rates, so relative to the local oscillator's arrow the echo's turns once per beat, and the length of their sum, whose square is the power, swings between $A - a$ and $A + a$: this is [](eq:beat) seen geometrically.
+
 <Beat />
 
 ## Range from a chirp
