@@ -1,0 +1,141 @@
+---
+title: RANSAC and ground segmentation
+created: 2026-10-30
+depends_on: [normals-and-local-features]
+---
+
+<script>
+    import Ransac from './Ransac.svelte';
+</script>
+
+The first thing most driving pipelines do with a scan, after cleaning it, is to separate the ground from everything standing on it. Ground points make up half or more of a typical outdoor scan; they carry little information about obstacles; and while they remain, every object is connected to every other through the road beneath them, so no clustering method can tell objects apart. Finding the ground is a problem of fitting a model, a plane or a surface, to data in which most points do not belong to it, and the standard tool for that is RANSAC. This writeup develops robust model fitting with RANSAC and then the methods used in practice to segment the ground, from a single plane to the region-wise fitting of current systems.
+
+This writeup builds on [Filtering, normals and local features](../normals-and-local-features/), whose least-squares plane fit by PCA is the model RANSAC robustifies, and on the [sampling density](../how-lidar-works/#sampling-density) of a scan, which shapes every ground segmentation method.
+
+# Why least squares is not enough
+
+The plane fit of the previous writeup, the eigenvector of the smallest eigenvalue of the covariance, minimises the sum of squared distances to the plane. Squared distances make it exquisitely sensitive to points that do not belong: a single point two metres from the ground, on the roof of a car, contributes as much to the cost as four hundred points ten centimetres off it, and a scan in which half the points are cars, walls and trees pulls the fitted plane far from the road. Least squares is optimal when every point is a noisy observation of the model, and nearly useless when a large fraction are not. Data with such _outliers_ needs an estimator that ignores them.
+
+# RANSAC
+
+_Random sample consensus_ (RANSAC) [](cite:fischler1981) inverts the logic of least squares. Rather than fitting all the data and hoping the outliers average out, it fits many models each to a _minimal sample_, the fewest points that determine a model, and keeps the model that the most points agree with. A plane is determined by three points, a line by two, a rigid transform by three point correspondences. If a sample happens to consist only of inliers, the model it determines is close to the truth and many points lie near it; if the sample contains an outlier, the model is arbitrary and few points do. So the algorithm is the following.
+
+1. Draw a minimal sample of $s$ points at random.
+2. Fit the model to the sample.
+3. Count the points within a distance $\tau$ of the model, its _consensus set_ or _inliers_.
+4. If the consensus set is the largest so far, keep the model.
+5. Repeat for $N$ iterations, then refit the best model to all its inliers by least squares.
+
+For a plane, the model through $\bfp_1, \bfp_2, \bfp_3$ has normal $\bfn \propto (\bfp_2 - \bfp_1) \times (\bfp_3 - \bfp_1)$ and offset $d = \bfn\T\bfp_1$, and a point $\bfp$ lies at distance $|\bfn\T\bfp - d|$ from it.
+
+```python
+def ransac_plane(points, tau=0.1, iters=200, rng=np.random.default_rng()):
+    """Largest-consensus plane (n, d), n·p = d, and its inlier mask."""
+    best_mask, best_count = None, -1
+    for _ in range(iters):
+        p1, p2, p3 = points[rng.choice(len(points), 3, replace=False)]
+        n = np.cross(p2 - p1, p3 - p1)
+        norm = np.linalg.norm(n)
+        if norm < 1e-9:                      # collinear sample: no plane
+            continue
+        n /= norm
+        mask = np.abs(points @ n - n @ p1) < tau
+        if mask.sum() > best_count:
+            best_mask, best_count = mask, mask.sum()
+    inliers = points[best_mask]               # refit by PCA on the consensus set
+    c = inliers.mean(axis=0)
+    n = np.linalg.eigh(np.cov((inliers - c).T))[1][:, 0]
+    return n, n @ c, best_mask
+```
+
+<Ransac />
+
+## How many iterations
+
+The number of iterations follows from a short probabilistic argument. If a fraction $w$ of the points are inliers, a sample of $s$ points drawn at random is all inliers with probability about $w^s$, and $N$ independent samples all fail with probability $(1 - w^s)^N$. Requiring that at least one sample succeeds with probability $p$ gives
+
+$$
+	N = \frac{\log(1 - p)}{\log(1 - w^s)}. @tag(ransac-iterations)
+$$
+
+For $p = 0.99$ the counts are as follows.
+
+| Inlier fraction $w$ | $0.9$ | $0.7$ | $0.5$ | $0.3$ | $0.1$  |
+| ------------------- | ----- | ----- | ----- | ----- | ------ |
+| Line, $s = 2$       | 3     | 7     | 17    | 49    | 459    |
+| Plane, $s = 3$      | 4     | 11    | 35    | 169   | 4603   |
+| $s = 4$             | 5     | 17    | 72    | 567   | 46050  |
+
+Two lessons follow. RANSAC is cheap when inliers are plentiful and the model is small, as for the ground plane of a scan. And the cost grows exponentially in the size of the minimal sample, which is why it pays to use models with as few parameters as possible, and why RANSAC over descriptor matches, which may be over ninety percent outliers, needs many thousands of iterations. Since $w$ is unknown in advance, implementations usually start from a pessimistic estimate and lower $N$ adaptively, recomputing [](eq:ransac-iterations) with the inlier fraction of the best model found so far.
+
+## Variants
+
+RANSAC has many refinements, of which a few are worth knowing by name.
+
+- **MSAC and MLESAC** score a model not by its number of inliers but by a robust cost that also rewards inliers for being close, which makes the choice between nearly equal models less arbitrary.
+- **PROSAC** samples first from the matches judged most reliable, such as descriptor matches with the best ratio-test scores, and finds a good model in far fewer iterations when such a ranking exists.
+- **LO-RANSAC** (locally optimised) refines each new best model by fitting it to its inliers and iterating, which improves accuracy and lets the main loop stop sooner.
+- **Sequential RANSAC** finds several models, such as the several planes of a room, by fitting one, removing its inliers, and repeating.
+
+The inlier threshold $\tau$ is the parameter that matters most. It should be a few times the noise of the inliers: too small and true inliers are rejected, too large and the consensus counts become dominated by points that merely happen to be near.
+
+A cousin of RANSAC, the _Hough transform_, reverses the voting: every point votes for all the models it is consistent with, in a discretised space of model parameters, and the model with the most votes wins. It is deterministic and finds several models at once, but its cost grows with the resolution and dimension of the parameter space, so it is used mostly for lines and circles in two dimensions.
+
+# Ground segmentation
+
+Ground segmentation labels each point of a scan as ground or non-ground. Its output feeds clustering, which separates objects only once the ground connecting them is gone; it feeds the estimation of the drivable area; and the fitted ground surface gives the vehicle's pitch and roll relative to the road. Errors in both directions are costly. Labelling an obstacle as ground deletes it: low objects such as kerbs, tyre debris, small animals and the lower parts of pedestrians are the usual victims. Labelling ground as obstacle creates phantom objects that make a vehicle brake for nothing, typically on slopes, at the crests of hills and on rough verges.
+
+The methods below are listed roughly in order of sophistication.
+
+## Height thresholds and a single plane
+
+The simplest method labels as ground every point below a fixed height in the vehicle frame, say $0.2$ m above the nominal road surface. It fails as soon as the vehicle pitches under braking or the road slopes, since a $3°$ slope rises $1$ m over $20$ m. A single plane fitted by RANSAC accounts for the vehicle's pitch and roll and for a constant slope, and is adequate for flat car parks and test tracks. But real roads are not planes: they crown towards their edges, change slope at the bottom and top of hills, and meet kerbs, verges and ramps. A single plane fitted to a whole scan is therefore always wrong somewhere, and every practical method fits the ground locally.
+
+## Elevation grids
+
+Dividing the ground plane into a bird's-eye grid of cells, a few tens of centimetres across, and recording the minimum and maximum height of the points in each, gives an _elevation map_. A cell whose points span little height, $z_{\max} - z_{\min} < \delta$, is flat and probably ground, and within any cell the points near $z_{\min}$ are probably ground. This handles gentle slopes, but it fails in cells that contain both ground and the base of an object, and in the far field, where cells receive too few points to judge.
+
+## Line fitting in polar segments
+
+Himmelsbach and colleagues [](cite:himmelsbach2010) exploit the radial structure of a spinning sensor's scan. The ground plane around the sensor is divided into narrow angular _segments_, like slices of a pie, and each segment into bins by range. Within a segment the points are projected onto a vertical plane, with coordinates $(d, z)$, the horizontal distance from the sensor and the height, and each bin is represented by its lowest point. Walking outwards along the segment, line segments are fitted incrementally to these representatives, and a line is accepted as ground if its slope is small and it starts near the expected ground height. A point is then labelled ground if it lies close to the ground line of its segment. Because each segment has its own piecewise-linear profile, slopes and changes of slope are handled naturally, at a cost linear in the number of points.
+
+## Angles in the range image
+
+Range-image pipelines label the ground column by column. In each column of the image, which holds the points of one azimuth from the lowest beam upwards, the inclination of the segment joining each pair of vertically adjacent points,
+
+$$
+	\alpha = \operatorname{atan2}\big(\Delta z, \sqrt{\Delta x^2 + \Delta y^2}\big),
+$$
+
+is near zero on flat ground, near the slope on a sloping road, and near $90°$ on the face of an obstacle. Starting from the lowest row, which on a vehicle usually sees the ground, a breadth-first search marks as ground the neighbours whose inclination is below a threshold and changes little from that of the ground already found. It needs no fitting at all, runs on the image in a few milliseconds, and is the natural partner of the range-image clustering of the next writeup.
+
+## Region-wise plane fitting
+
+The methods that perform best on benchmarks fit planes to many small regions. _Ground plane fitting_ (GPF) [](cite:zermas2017) divides the scan into a few segments along the direction of travel and in each one fits a plane iteratively: the average height of the lowest points, the _lowest point representative_, selects seed points near it; a plane is fitted to the seeds by PCA; every point within a threshold of the plane is taken as ground; and the fit is repeated a few times on the new ground set. Starting from the lowest points rather than from random samples is what makes the fit converge to the ground and not to a car roof.
+
+_Patchwork_ [](cite:lim2021) refines this with a _concentric zone model_: the area around the sensor is divided into rings, and each ring into patches whose size grows with range, so that patches far from the sensor, where points are sparse, are large enough to contain a fittable number of them, while patches near it are small enough to follow the shape of the ground. A plane is fitted in each patch by the same region-wise PCA, and is accepted as ground only if it passes tests of _uprightness_ (its normal is near vertical), _elevation_ (it is not far above the expected ground for its distance) and _flatness_ (its smallest eigenvalue is small relative to the others, the surface variation of the previous writeup). These checks reject the planes fitted to the flat tops of cars and walls that defeat simpler methods.
+
+```python
+def fit_ground_patch(points, n_lpr=20, seed_tau=0.4, dist_tau=0.15, iters=3):
+    """Region-wise plane fit in the style of GPF: seed from the lowest points, then refine."""
+    z = points[:, 2]
+    lpr = np.sort(z)[:n_lpr].mean()                  # lowest point representative
+    ground = points[z < lpr + seed_tau]
+    for _ in range(iters):
+        c = ground.mean(axis=0)
+        eigvals, eigvecs = np.linalg.eigh(np.cov((ground - c).T))
+        n = eigvecs[:, 0] * np.sign(eigvecs[2, 0])   # normal pointing up
+        mask = np.abs((points - c) @ n) < dist_tau
+        ground = points[mask]
+    upright = n[2] > np.cos(np.radians(20))
+    flat = eigvals[0] / eigvals.sum() < 0.01
+    return mask if upright and flat else np.zeros(len(points), bool)
+```
+
+## Learned segmentation
+
+Ground is one of the classes predicted by semantic segmentation networks, which label every point as road, sidewalk, vegetation, car and so on, and on benchmarks such as SemanticKITTI these outperform geometric methods. Geometric methods remain in wide use because they need no labelled data, transfer between sensors and mounting positions, run in a few milliseconds on a CPU, and fail in ways that can be predicted and tested, which matters in safety-critical systems. A common arrangement runs a geometric method as a fallback or a check on a learned one.
+
+# Summary
+
+Least-squares fits are destroyed by outliers; RANSAC fits minimal samples and keeps the model with the largest consensus, needing a number of iterations [](eq:ransac-iterations) that grows exponentially with the sample size. Ground segmentation applies robust fitting locally, because real ground is not a plane: by line fitting in polar segments, by inclination angles in the range image, or by region-wise plane fitting with tests of uprightness, elevation and flatness. With the ground removed, the remaining points fall apart into separate objects, which the next writeup finds by clustering.

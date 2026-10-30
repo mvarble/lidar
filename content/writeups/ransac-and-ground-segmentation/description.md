@@ -1,0 +1,1 @@
+Robust model fitting with RANSAC (its algorithm, iteration count and variants) and the methods used to separate ground from obstacles in a scan: height thresholds, elevation grids, polar line fitting, range-image angles and region-wise plane fitting.
