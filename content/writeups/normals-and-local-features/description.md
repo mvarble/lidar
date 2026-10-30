@@ -1,0 +1,1 @@
+Cropping and outlier removal, surface normals by principal component analysis and how to orient them and choose their scale, the shape features given by the covariance's eigenvalues, and keypoints and descriptors (FPFH) for matching points between clouds.

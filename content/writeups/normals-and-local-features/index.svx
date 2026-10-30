@@ -1,0 +1,140 @@
+---
+title: Filtering, normals and local features
+created: 2026-10-30
+depends_on: [neighbour-search]
+---
+
+<script>
+    import Normals from './Normals.svelte';
+</script>
+
+A raw point records only a position. Most of what an algorithm needs to know about a point, whether it is noise, whether it lies on a plane, an edge or a bush, which way the surface beneath it faces, and what its surroundings look like, is a property of its neighbourhood rather than of the point itself. This writeup describes how those properties are computed: first the filters that remove points that should not be there, then the estimation of surface normals by principal component analysis, the shape features that come from the same computation, and finally the keypoints and descriptors that summarise a neighbourhood well enough to recognise it in another scan.
+
+This writeup builds on [Spatial data structures and neighbour search](../neighbour-search/), which provides the neighbourhoods every computation here starts from, and it refers to the [imperfections of the data](../how-lidar-works/#imperfections-of-the-data) that the filters remove.
+
+# Cropping and filtering
+
+The first steps of almost every pipeline are not clever, but they are always there. A _crop box_ or _pass-through filter_ keeps only the points within some region, such as a band of heights or a range of distances; it removes points on the vehicle's own body, which a roof-mounted sensor always sees, as well as returns too close to be trusted or too far to matter. Invalid points, with zero or NaN range, are dropped, and points can be filtered on their intensity or their return number. These cost $O(N)$ and need no neighbours.
+
+## Statistical outlier removal
+
+Isolated points produced by interference, mixed pixels, dust or rain lie far from the surfaces around them, so they can be found by how far they are from their neighbours. _Statistical outlier removal_ (PCL's `StatisticalOutlierRemoval`) computes, for each point $\bfp_i$, the mean distance $\bar d_i$ to its $k$ nearest neighbours, and then the mean $\mu$ and standard deviation $\sigma$ of the $\bar d_i$ over the whole cloud. A point is discarded if
+
+$$
+	\bar d_i > \mu + \alpha\sigma,
+$$
+
+for a multiplier $\alpha$ typically between $1$ and $3$. With a k-d tree the cost is $O(N k \log N)$.
+
+## Radius outlier removal
+
+_Radius outlier removal_ discards a point if it has fewer than $m$ neighbours within a radius $\varepsilon$. It is simpler than the statistical filter but shares its main flaw on LiDAR data: the density of a scan falls with the square of the range, so a threshold that removes noise near the sensor also removes legitimate, sparse points on distant objects. Variants used on LiDAR scale the radius with each point's range, $\varepsilon_i = \varepsilon_0 \lVert\bfp_i\rVert$, so that the neighbourhood covers a fixed angle rather than a fixed distance; filters designed to remove falling snow work this way, since snowflakes produce isolated returns that are sparse even at short range.
+
+Filtering always trades false removals against missed noise, and a filter that is too aggressive deletes exactly the small, distant objects, a pedestrian at sixty metres, that perception most needs to see. Learned methods increasingly replace hand-tuned filters for weather in particular.
+
+# Surface normals
+
+Most of the surfaces a LiDAR sees, roads, walls, vehicle bodies, are locally smooth, and the most useful property of a point on a smooth surface is the direction its surface faces, the _normal_. Normals drive point-to-plane registration, ground segmentation, region growing, meshing, and the descriptors later in this writeup. A point cloud does not contain normals, so they are estimated from neighbourhoods [](cite:hoppe1992).
+
+## Normals by principal component analysis
+
+Let $\bfp_1, \dots, \bfp_k$ be the neighbours of a point, with centroid $\bfc = \frac{1}{k}\sum_j \bfp_j$. The plane through $\bfc$ with unit normal $\bfn$ that best fits them, in the sense of least squared perpendicular distances, minimises
+
+$$
+	\sum_{j=1}^{k} \big(\bfn\T(\bfp_j - \bfc)\big)^2 = \bfn\T C\,\bfn \cdot k,
+	\qquad
+	C = \frac{1}{k}\sum_{j=1}^{k} (\bfp_j - \bfc)(\bfp_j - \bfc)\T, @tag(covariance)
+$$
+
+subject to $\lVert\bfn\rVert = 1$. The matrix $C$ is the covariance of the neighbourhood, symmetric and positive semi-definite, and the minimum of the Rayleigh quotient $\bfn\T C\bfn$ over unit vectors is its smallest eigenvalue, attained at the corresponding eigenvector. So the estimated normal is the eigenvector of $C$ with the smallest eigenvalue. This is principal component analysis of the neighbourhood: the two directions in which the points spread most span the tangent plane, and the direction in which they spread least is the normal.
+
+```python
+def estimate_normals(points, tree, k=20):
+    """PCA normals from the k nearest neighbours of each point (tree: scipy cKDTree)."""
+    _, idx = tree.query(points, k=k)
+    nbrs = points[idx]                                   # (N, k, 3)
+    centred = nbrs - nbrs.mean(axis=1, keepdims=True)
+    C = np.einsum('nki,nkj->nij', centred, centred) / k  # (N, 3, 3)
+    eigvals, eigvecs = np.linalg.eigh(C)                 # ascending eigenvalues
+    return eigvecs[:, :, 0], eigvals
+```
+
+Each normal costs a neighbour query and a $3 \times 3$ symmetric eigendecomposition, which has a closed form, so normals for a whole scan take milliseconds.
+
+## Orientation
+
+The eigenvector is determined only up to sign: $\bfn$ and $-\bfn$ fit equally well. For a single LiDAR scan the sign is fixed by the sensor, since a surface that was seen must face it: each normal is flipped if necessary so that $\bfn\T(\bfv - \bfp) > 0$, where $\bfv$ is the sensor's position. For merged clouds without a single viewpoint, orientations are propagated across a graph of neighbouring points, flipping each to agree with its neighbours, which is the approach of [](cite:hoppe1992).
+
+## The choice of scale
+
+The neighbourhood size is the one real parameter, and it cannot be right everywhere. Too few neighbours and the range noise of each point dominates, so normals scatter. Too many and the neighbourhood spans more than one surface, so normals near corners and on curved objects are averaged into directions that belong to neither surface. LiDAR's varying density complicates the trade, since $k$ neighbours span centimetres near the sensor and metres far from it, and a radius that suits the near field finds too few neighbours in the far field. Hybrid queries (up to $k$ neighbours within a radius) and radii that grow with range are the usual compromises.
+
+<Normals />
+
+On an organised scan, a cheaper estimate uses the range image directly: the cross product of the vectors to the neighbouring pixels on the left and right and above and below,
+
+$$
+	\bfn \propto (\bfp_{u+1,v} - \bfp_{u-1,v}) \times (\bfp_{u,v+1} - \bfp_{u,v-1}),
+$$
+
+computed only where those neighbours are near in space as well as in the image.
+
+# Shape from eigenvalues
+
+The eigenvalues of the covariance [](eq:covariance), ordered $\lambda_1 \ge \lambda_2 \ge \lambda_3 \ge 0$, describe the shape of the neighbourhood as well as its orientation. A neighbourhood on a plane has $\lambda_3 \approx 0$ and two comparable larger eigenvalues; one on a pole or a wire has a single dominant eigenvalue; one in foliage or noise spreads in every direction, with all three comparable. The _surface variation_, often loosely called curvature,
+
+$$
+	\sigma = \frac{\lambda_3}{\lambda_1 + \lambda_2 + \lambda_3} \in \big[0, \tfrac{1}{3}\big],
+$$
+
+is zero on a perfect plane and grows at edges, corners and in clutter. Normalised differences give three features that sum to one,
+
+$$
+	\text{linearity} = \frac{\lambda_1 - \lambda_2}{\lambda_1}, \qquad
+	\text{planarity} = \frac{\lambda_2 - \lambda_3}{\lambda_1}, \qquad
+	\text{scattering} = \frac{\lambda_3}{\lambda_1},
+$$
+
+and with the normal's angle to the vertical, the height of the point above the ground and its intensity, they are the classic hand-crafted features for classifying points as ground, building, pole, vegetation or vehicle with a random forest, a method that remains a strong baseline in mapping. Thresholds on the same quantities pick out the points of high curvature that register well along edges and those of low curvature that register well on planes; a fast variant of that idea computed along each scan line is the feature extractor of the LOAM odometry system, described in the writeup on odometry and SLAM.
+
+# Keypoints and descriptors
+
+Some problems require recognising the same piece of surface in two clouds without knowing how they are aligned: registering two scans with no initial guess, relocalising a vehicle in a map, recognising that a place has been visited before. Normals and eigenvalues do not suffice, since many points share them, and they are not distinctive enough to match. The answer is to describe each point's neighbourhood by a richer vector, a _descriptor_, chosen so that it is unchanged by rotation and translation, and to match points by comparing descriptors.
+
+Describing every point is expensive and most are not distinctive, so descriptors are often computed only at _keypoints_, points whose neighbourhoods are distinctive and can be found again reliably. The Intrinsic Shape Signatures detector, for example, keeps points whose three eigenvalues are well separated, so that their local frame is well defined, and whose smallest eigenvalue is a local maximum; 3D extensions of the Harris corner detector serve the same purpose. Uniform subsampling is a common and surprisingly effective alternative.
+
+## Fast point feature histograms
+
+Of the many hand-crafted descriptors (spin images, shape contexts, SHOT), the _fast point feature histogram_ (FPFH) [](cite:rusu2009) is the one most used in practice, being built into PCL and Open3D. It describes a neighbourhood by how the normals within it are oriented relative to one another, which is invariant to rigid motion.
+
+For a pair of points $\bfp_s$ and $\bfp_t$ with normals $\bfn_s$ and $\bfn_t$, separated by $d = \lVert\bfp_t - \bfp_s\rVert$, a local frame (a _Darboux frame_) is fixed at $\bfp_s$:
+
+$$
+	\bfu = \bfn_s, \qquad \bfv = \bfu \times \frac{\bfp_t - \bfp_s}{d}, \qquad \bfw = \bfu \times \bfv.
+$$
+
+The relative orientation of the pair is captured by three angles,
+
+$$
+	\alpha = \bfv \cdot \bfn_t, \qquad
+	\phi = \bfu \cdot \frac{\bfp_t - \bfp_s}{d}, \qquad
+	\theta = \operatorname{atan2}(\bfw \cdot \bfn_t,\ \bfu \cdot \bfn_t),
+$$
+
+none of which changes if the pair is moved rigidly. The _simplified point feature histogram_ (SPFH) of a point bins these three quantities, computed between the point and each of its neighbours, into three histograms of eleven bins each, concatenated into a $33$-dimensional vector. The FPFH then adds a distance-weighted sum of the neighbours' SPFHs,
+
+$$
+	\operatorname{FPFH}(\bfp) = \operatorname{SPFH}(\bfp) + \frac{1}{k}\sum_{j=1}^{k} \frac{1}{\omega_j} \operatorname{SPFH}(\bfp_j),
+$$
+
+where $\omega_j$ is the distance from $\bfp$ to its neighbour $\bfp_j$, so that each point's descriptor reflects the geometry of a region about twice the radius of a single neighbourhood. Its cost is $O(Nk)$ given the neighbourhoods, which is what makes it _fast_ compared with its predecessor, the point feature histogram, which considered every pair in a neighbourhood at $O(Nk^2)$. The descriptor's radius should be several times that used for the normals, so that it covers a distinctive region.
+
+## Matching descriptors
+
+Descriptors are matched by nearest-neighbour search in descriptor space, with a k-d tree or an approximate method, since $33$ dimensions is already too many for an exact k-d tree to prune well. Most matches found this way are wrong, because many neighbourhoods look alike, so two filters are common. A _mutual_ (or _reciprocal_) filter keeps a match between $\bfp$ and $\bfq$ only if each is the other's nearest neighbour. A _ratio test_ keeps a match only if the nearest descriptor is clearly nearer than the second nearest. Even after filtering, a large fraction of matches remain outliers, which is why descriptor matching is always followed by a robust estimator such as RANSAC, the subject of the next writeup, to find the transform that the inliers agree on.
+
+Since around 2019, descriptors learned by neural networks have overtaken hand-crafted ones in matching accuracy on benchmarks, though FPFH remains the default in libraries and a strong baseline because it needs no training data and transfers between sensors and environments.
+
+# Summary
+
+Crop boxes and outlier filters remove the points that should not be there, with care not to remove sparse distant objects. The covariance of a neighbourhood [](eq:covariance) gives, through its eigendecomposition, the surface normal (the eigenvector of the smallest eigenvalue, oriented towards the sensor) and the shape of the neighbourhood (linear, planar or scattered, through the eigenvalues). Descriptors such as FPFH summarise a neighbourhood invariantly to rigid motion so that points can be matched between clouds that are not yet aligned. The next writeup turns from describing local geometry to fitting models to it robustly: RANSAC and its application to finding the ground.
