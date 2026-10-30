@@ -1,0 +1,1 @@
+How networks consume point clouds (PointNet and PointNet++, voxel networks with sparse convolution, PointPillars, range-view networks), anchor- and centre-based detection heads, non-maximum suppression, the KITTI, nuScenes and Waymo metrics, LiDAR-specific training practice, and camera fusion.

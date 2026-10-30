@@ -1,0 +1,128 @@
+---
+title: Deep learning on point clouds
+created: 2026-10-30
+depends_on: [neighbour-search, clustering-and-bounding-boxes]
+---
+
+<script>
+    import Pillars from './Pillars.svelte';
+</script>
+
+Since about 2017, deep networks have replaced hand-engineered pipelines for most of LiDAR perception. A network trained on labelled scans detects cars, pedestrians and cyclists with oriented boxes far more accurately than clustering and box fitting; it labels every point with a semantic class; and it predicts velocities and future motion from a few consecutive scans. This writeup describes how networks are made to work on point clouds, which do not fit the grid of pixels that convolutional networks were designed for. It covers the three ways of representing a scan for a network (as points, as voxels or pillars, and as a range image) and the landmark architecture of each; the detection heads that turn features into boxes; the non-maximum suppression that removes duplicate detections; the benchmarks and metrics by which detectors are compared; and the training practices particular to LiDAR. It is the foundation for the writeups of recent papers elsewhere on the site.
+
+This writeup builds on [Spatial data structures and neighbour search](../neighbour-search/), for the voxel grids and neighbour queries that networks reuse, and on [Clustering and bounding boxes](../clustering-and-bounding-boxes/), for the oriented boxes that detectors predict and the classical method they replaced. It assumes familiarity with neural networks, convolutional networks and their training by gradient descent.
+
+# Tasks and benchmarks
+
+The central task is _3D object detection_: for each object of the classes of interest, predict an oriented box, its centre $(x, y, z)$, its size $(l, w, h)$ and its heading $\theta$ about the vertical, with a class and a confidence, and often a velocity. _Semantic segmentation_ labels each point with a class (road, sidewalk, building, vegetation, car, person and so on), and _panoptic segmentation_ adds an instance identity to the points of countable objects. Progress has been driven by public datasets: KITTI [](cite:geiger2012), recorded with a single 64-beam sensor, which defined the field's early benchmarks; nuScenes [](cite:caesar2020), with a 32-beam sensor, cameras and radars round the vehicle and a thousand scenes in Boston and Singapore; and the Waymo Open Dataset [](cite:sun2020), with a larger and more varied set of scenes and higher-resolution LiDAR.
+
+# Why point clouds are awkward for networks
+
+A convolutional network expects a dense grid in which each position has a fixed set of neighbours. A point cloud has none of this. It is a _set_, so its points have no meaningful order and any function of it should not depend on the order in which they are listed. It is _irregular_: points do not lie on a grid, and the neighbours of a point must be searched for. It is _sparse_: a scan's points cover a few percent of the cells of any fine three-dimensional grid around the vehicle. And its density varies by orders of magnitude with range, as [How LiDAR works](../how-lidar-works/#sampling-density) explains. Each family of architectures below resolves these problems differently.
+
+# Networks on points
+
+## PointNet
+
+PointNet [](cite:qi2017) handles the unordered set directly. It applies the same small network, a _shared_ multilayer perceptron $h$, to every point independently, lifting each to a feature vector of, say, $1024$ dimensions, and then combines the vectors with an elementwise maximum over the points, which does not depend on their order:
+
+$$
+	f(\{\bfp_1, \dots, \bfp_N\}) = \gamma\Big(\max_{i = 1, \dots, N} h(\bfp_i)\Big),
+$$
+
+where a final network $\gamma$ maps the pooled feature to the output, such as class scores. The result is invariant to permutations of the points by construction. The authors show that functions of this form can approximate any continuous function of point sets arbitrarily well, with continuity measured in the Hausdorff distance between sets [Theorem 1](cite:qi2017). For segmentation, the pooled global feature is concatenated back onto each point's own feature and a further shared network predicts each point's label. PointNet also learns a small _transformation network_ that predicts a $3 \times 3$ matrix to align the input to a canonical orientation before the shared network.
+
+PointNet's weakness is that each point's feature is computed in isolation, and the only interaction between points is the single global maximum. It cannot see local structure, the way the points around a corner or along a pole are arranged, which convolutional networks capture with their small kernels and which matters for recognising objects in cluttered scenes.
+
+## PointNet++
+
+PointNet++ [](cite:qi2017b) restores locality by applying PointNet hierarchically, as a convolutional network applies kernels in successive layers. Each _set abstraction_ layer selects a subset of the points as centres, groups the points around each centre, and runs a small PointNet on each group, with coordinates expressed relative to its centre, to produce one feature vector per centre. Stacking layers gives features that summarise ever larger regions from ever fewer centres.
+
+The centres are chosen by _farthest point sampling_: starting from an arbitrary point, repeatedly add the point farthest from all those chosen so far. This covers the cloud evenly regardless of its density, at a cost of $O(NM)$ to choose $M$ centres from $N$ points, since each new centre requires updating every point's distance to its nearest centre. Groups are formed by _ball query_, a radius search about each centre that keeps up to a fixed number of points, using the structures of [the writeup on neighbour search](../neighbour-search/). To cope with varying density, _multi-scale grouping_ runs PointNets on groups of several radii about each centre and concatenates their features. Point-based detectors such as PointRCNN [](cite:shi2019) use a PointNet++ backbone to segment foreground points and propose a box from each, refining the proposals in a second stage.
+
+Point-based networks are accurate and work on the raw points without quantisation, but farthest point sampling and ball queries on unordered points are slow on GPUs, which has limited their use in real-time driving systems.
+
+# Networks on voxels and pillars
+
+The alternative is to impose a grid after all, by voxelising the cloud, and then to use convolutions, the most mature and best optimised operation in deep learning.
+
+## VoxelNet and sparse convolution
+
+VoxelNet [](cite:zhou2018) divides space into voxels and encodes the points in each with a small PointNet, a _voxel feature encoding_ layer, so that the network learns how to summarise a voxel's points rather than being given hand-made statistics. The voxel features then pass through 3D convolutions, which reduce the vertical dimension, and a 2D convolutional network in the bird's-eye view predicts the boxes. Dense 3D convolution over a grid round the vehicle is slow, however, since almost all of its voxels are empty.
+
+SECOND [](cite:yan2018) made voxel networks fast with _sparse convolution_, which stores only the occupied voxels, as a list of coordinates and features, and computes outputs only where they can be non-zero. For each output site, the pairs of input and output voxels related by each kernel offset are found with a hash table of coordinates, gathered into a _rule book_, and the convolution becomes a set of dense matrix multiplications over those pairs. A standard sparse convolution activates every voxel within the kernel's reach of an input voxel, so the set of active sites dilates with each layer and the data becomes less sparse. A _submanifold_ sparse convolution [](cite:graham2018) computes outputs only at sites that were already active, keeping the sparsity pattern fixed, which keeps deep stacks of layers cheap; networks interleave the two, using ordinary sparse convolutions with stride to downsample. Sparse 3D backbones of this kind remain the basis of many of the most accurate detectors.
+
+## PointPillars
+
+PointPillars [](cite:lang2019) removed 3D convolution altogether. It divides the ground plane into a grid of vertical columns, _pillars_, each extending the full height of the scene, so there is no vertical discretisation. Each point in a pillar is described by nine numbers: its coordinates and reflectance, its offsets from the mean of the pillar's points, and its offsets from the pillar's centre on the grid. Up to $K$ points are kept per pillar, sampling when there are more and padding with zeros when there are fewer, giving a dense tensor of $P$ non-empty pillars by $K$ points by nine features. A PointNet, a shared linear layer with normalisation and a ReLU followed by a maximum over each pillar's points, turns each pillar into a $C$-dimensional feature, and the features are _scattered_ back to their pillars' grid positions to form a $C \times H \times W$ _pseudo-image_ in the bird's-eye view. From there the network is an ordinary 2D detector. Because everything after the scatter is standard 2D convolution, PointPillars runs very fast, which is why it is widely deployed and a common baseline.
+
+<Pillars />
+
+# Networks on range images
+
+A third approach keeps the sensor's own layout. Projecting a scan into its range image, as described in [the writeup on coordinate frames](../frames-and-transforms/#projection-into-images-and-grids), gives a dense $H \times W$ image whose channels hold range, coordinates and intensity, and any 2D segmentation network can process it. RangeNet++ [](cite:milioto2019) segments scans this way with a 2D convolutional encoder–decoder and then corrects a characteristic error of the projection. Labels predicted in the image are blurred across depth discontinuities, so a pixel on the edge of a car may be labelled "car" although its point lies on the wall behind, and when labels are transferred back to the points, such errors appear as shadows of each object's label on the background. RangeNet++ fixes this with a fast k-nearest-neighbour vote in 3D among each point's neighbours in the image window, weighted by their range difference.
+
+Range-view networks are compact and fast and use the sensor's full resolution, but objects change size in the image with their distance and are distorted by the projection, so for box detection the bird's-eye view, in which an object's size does not depend on its range, has generally proved more effective. Many current detectors combine views, extracting features in the range view and projecting them into the bird's-eye view for detection.
+
+# Detection heads
+
+Whatever the backbone, most detectors end in a bird's-eye-view feature map, from which a _head_ predicts boxes. Two designs dominate.
+
+## Anchor-based heads
+
+An _anchor-based_ head, as in SECOND and PointPillars, places at each cell of the feature map a set of _anchor_ boxes, one per class at each of two headings, $0°$ and $90°$, with the average size of that class. Each anchor is assigned to a ground-truth box if their bird's-eye IoU exceeds a threshold, and the head learns to classify each anchor and to regress the residuals between it and its assigned box, normalised by the anchor's dimensions, such as
+
+$$
+	\Delta x = \frac{x_g - x_a}{d_a}, \qquad \Delta l = \log\frac{l_g}{l_a}, \qquad \Delta\theta = \sin(\theta_g - \theta_a), \qquad d_a = \sqrt{l_a^2 + w_a^2},
+$$
+
+where the subscripts $g$ and $a$ mark the ground truth and the anchor. The sine makes the heading loss treat a box and the same box turned by $180°$ alike, which is easier to learn, and a separate classifier predicts which of the two directions is meant. Almost all anchors fall on the background, so the classification loss is the _focal loss_ [](cite:lin2017), which down-weights the many easy negatives so that they do not swamp the few positives.
+
+## Centre-based heads
+
+CenterPoint [](cite:yin2021) represents each object by its centre. For each class, the head predicts a _heatmap_ over the bird's-eye grid, trained against targets in which each ground-truth centre is a small Gaussian bump, and at each cell it regresses the sub-cell offset of the centre, its height, its size (as logarithms), its heading (as the sine and cosine of $\theta$, which avoids the discontinuity of the angle itself) and its velocity. Objects are read off as the local maxima of the heatmap. Representing objects by points rather than boxes removes the need to design anchors, handles rotated objects naturally, and, through the predicted velocity, provides the association for the simple tracker described in [Multi-object tracking](../multi-object-tracking/#assignment). A light second stage refines each box using features sampled from its faces. Centre-based heads are now standard.
+
+## Non-maximum suppression
+
+A detector fires many times on each object, at neighbouring anchors or heatmap cells, and the duplicates must be removed. _Non-maximum suppression_ (NMS) sorts the detections by confidence, keeps the most confident, discards every remaining detection that overlaps it by more than an IoU threshold, and repeats with the next most confident survivor.
+
+```python
+def nms(boxes, scores, iou, threshold=0.5):
+    """Indices of the boxes kept by greedy non-maximum suppression; iou(a, b) is box overlap."""
+    order = list(np.argsort(-scores))
+    keep = []
+    while order:
+        best = order.pop(0)
+        keep.append(best)
+        order = [i for i in order if iou(boxes[best], boxes[i]) < threshold]
+    return keep
+```
+
+For oriented boxes in the bird's-eye view the IoU is that of two rotated rectangles, computed by clipping one polygon against the other. Greedy NMS costs $O(n^2)$ in the worst case for $n$ detections, and is usually applied per class after discarding detections below a confidence floor. CenterPoint largely replaces it by taking only heatmap cells that are maxima within a small window, a max-pooling operation, though NMS is still applied in some configurations.
+
+# Evaluation
+
+Detections are matched to ground-truth boxes and scored by _average precision_ (AP), the area under the precision–recall curve as the confidence threshold is lowered. KITTI matches a detection to an object if their 3D (or bird's-eye) IoU exceeds $0.7$ for cars and $0.5$ for pedestrians and cyclists, and reports AP for three difficulty levels determined by the size, occlusion and truncation of the objects. The nuScenes benchmark [](cite:caesar2020) matches by the distance between box centres on the ground, averaging AP over thresholds of $0.5$, $1$, $2$ and $4$ m, and combines this mean AP with five _true-positive_ errors, of translation, scale, orientation, velocity and attributes, into the _nuScenes detection score_,
+
+$$
+	\mathrm{NDS} = \frac{1}{10}\Big[5\,\mathrm{mAP} + \sum_{\mathrm{mTP}} \big(1 - \min(1, \mathrm{mTP})\big)\Big].
+$$
+
+The Waymo dataset [](cite:sun2020) reports, besides AP, APH, in which each true positive is weighted by the accuracy of its heading. Semantic segmentation is scored by the mean over classes of the IoU between predicted and true point sets.
+
+# Training on LiDAR
+
+A few practices are particular to LiDAR detectors and are worth knowing.
+
+- **Ground-truth sampling.** Introduced with SECOND [](cite:yan2018), this augmentation builds a database of the points inside every labelled box in the training set and pastes some into each training scan at random free positions, which multiplies the examples of rare classes. Pasted objects must not collide with existing ones, and some methods also respect occlusion.
+- **Global and per-object augmentation.** Random rotations about the vertical axis, scalings and flips of the whole scan, and small random rotations and translations of individual objects.
+- **Multiple sweeps.** A single 32-beam scan is sparse, so nuScenes models concatenate the last ten sweeps, each transformed into the current frame by the ego motion, with the time offset of each point as an extra channel; moving objects then leave short trails from which the network learns their velocity.
+- **Range and density.** Performance falls steeply with range as objects become sparse, and evaluating by range bands reveals what a single AP hides.
+
+# Fusion with cameras
+
+LiDAR measures geometry precisely but sparsely and without colour; cameras see colour and texture densely but measure depth poorly. Fusing them improves detection of small and distant objects. _PointPainting_ [](cite:vora2020) is the simplest effective scheme: an image segmentation network labels the camera images, each LiDAR point is projected into the images with the [pinhole model](../frames-and-transforms/#projection-into-a-camera), and its class scores are appended to its features before any LiDAR detector runs. Most recent systems instead fuse in the bird's-eye view, lifting image features into that view with estimated depths and concatenating them with the LiDAR features, or attend from LiDAR proposals to image features with transformers.
+
+# Summary
+
+Networks consume point clouds in three ways: as sets of points, with PointNet's shared network and symmetric max-pooling made local by PointNet++'s sampling and grouping; as voxels or pillars, with sparse 3D convolutions or PointPillars' learned pillar features scattered into a bird's-eye pseudo-image; and as range images, with 2D networks and a correction for label bleeding at depth edges. Bird's-eye detection heads predict boxes from anchors or, now more often, from centre heatmaps, and non-maximum suppression removes duplicates. Detectors are compared by IoU-based AP on KITTI, by centre-distance AP and NDS on nuScenes, and by heading-weighted APH on Waymo. This completes the crash course; the writeups of research papers elsewhere on the site build on it.
