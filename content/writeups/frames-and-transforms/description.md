@@ -1,0 +1,1 @@
+Coordinate frames, rotations (matrices, Euler angles, axis–angle, quaternions), rigid transforms in SE(3) and the exponential map, and the operations built on them: extrinsic calibration, projection into cameras, range images and bird's-eye grids, and deskewing a moving scan.
