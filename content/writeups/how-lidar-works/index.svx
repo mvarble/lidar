@@ -8,9 +8,10 @@ updated: 2026-10-30
     import Waveform from './Waveform.svelte';
     import ScanPattern from './ScanPattern.svelte';
     import Beat from './Beat.svelte';
+    import Electronics from './Electronics.svelte';
 </script>
 
-A LiDAR (light detection and ranging) sensor measures distance by timing light. It fires a short pulse of laser light, waits for the echo, and converts the round-trip time into a range; by steering the beam across a field of view many times a second it builds up a three-dimensional sample of its surroundings, the _point cloud_. This writeup explains how that happens: the physics of the measurement, the electronics that make it, the ways a beam is steered, and, most importantly for everything that follows in the course, the structure, density and defects of the data that comes out. Every algorithm in the later writeups is shaped by the facts established here: that the data is a sparse, irregular sample of surfaces, organised by beam and by time, that thins with distance and is riddled with occlusion shadows. A standard reference for the hardware is [](cite:mcmanamon2019).
+A LiDAR (light detection and ranging) sensor measures distance by timing light. It fires a short pulse of laser light, waits for the echo, and converts the round-trip time into a range; by steering the beam across a field of view many times a second it builds up a three-dimensional sample of its surroundings, the _point cloud_. This writeup explains how that happens: the physics of the measurement, the ways a beam is steered, the electronics that make the measurement, the sensors on the market and how they keep time, and, most importantly for everything that follows in the course, the structure, density and defects of the data that comes out. Every algorithm in the later writeups is shaped by the facts established here: that the data is a sparse, irregular sample of surfaces, organised by beam and by time, that thins with distance and is riddled with occlusion shadows. A standard reference for the hardware is [](cite:mcmanamon2019).
 
 # Ranging by time of flight
 
@@ -128,6 +129,93 @@ A single range measurement is one point. To sample a scene, the sensor must poin
 - **Optical phased arrays** steer the beam electronically by controlling the phase of light across an array of emitters, as phased-array radar does, though they remain largely a research technology.
 
 Whatever the mechanism, every measurement has a direction known from the geometry of the sensor (which channel fired, and the angle the head or mirror was at) and a range from the echo.
+
+# Inside the sensor
+
+The sections above describe the physics; this one describes the electronics that put it to work. However it is built, a LiDAR has the same few jobs to do: keep time, fire the laser, turn the faint echo into an electrical signal, measure when it arrived, point the beam, and package the results. The figure shows how these jobs divide into blocks for the two architectures, and the paragraphs after it take the blocks in turn.
+
+<Electronics />
+
+## The reference clock
+
+Every time measurement in the sensor is ultimately a count of the ticks of one clock. That clock begins as a quartz crystal oscillator, typically at a few tens of megahertz, often temperature-compensated (a TCXO) so that its frequency barely drifts as the sensor warms up. A _phase-locked loop_ (PLL) multiplies its frequency to the hundreds of megahertz or more at which the digital logic runs. Two properties of this clock matter, and they matter very differently.
+
+Its _accuracy_, how close its frequency is to the nominal value, matters little for ranging. A crystal off by $50$ parts per million makes every measured time, and so every range, $50$ parts per million too long or too short: $5$ mm at $100$ m, below the noise of a typical sensor, and removable by calibration anyway. Its _jitter_, the random wander of each tick about where it should be, matters much more, because it adds directly to the timing noise of every measurement: by [](eq:tof), a jitter of $10$ ps is $1.5$ mm of range noise. Sensors therefore use low-jitter oscillators and PLLs, and the clock is distributed with the care given to a radio's local oscillator.
+
+## The controller
+
+At the centre sits a field-programmable gate array (FPGA), or, in sensors made in volume, a custom application-specific integrated circuit (ASIC) or system-on-chip that does the same work at lower cost and power. It schedules the firings, deciding which channel fires when, often with small random offsets so that the pulses of other LiDARs do not line up with its own; it reads the scanner's angle; it runs the time measurement; it applies the factory calibration, correcting range walk and each channel's angles and offsets; it computes intensity or reflectivity; and it packs the results into network packets. The time-to-digital converters described [earlier](#ranging-by-time-of-flight) are often built inside the FPGA itself, from its chains of fast carry logic used as tapped delay lines, which can resolve intervals of ten or twenty picoseconds.
+
+## The laser driver
+
+A pulsed laser diode needs a current of tens of amperes for a few nanoseconds. The driver stores charge in a capacitor and dumps it through the laser with a fast switch, today usually a gallium nitride (GaN) transistor, which switches far faster than a silicon one. The difficulty is inductance. By $V = L\,\mathrm{d}I/\mathrm{d}t$, driving $40$ A in $2$ ns through a mere $1$ nH of wiring takes $20$ V just to overcome the wiring, so the capacitor, switch and laser are packed millimetres apart, and the layout of this small circuit decides how short and how strong the pulses can be. Arrays of VCSELs are driven in banks, a group at a time, which is how sensors with many channels fire them in sequence.
+
+## The receiver chain
+
+The photodetector needs a bias voltage, and the kind of voltage depends on the kind of detector. An APD is biased at tens to a few hundred volts, and its gain depends steeply on temperature, so a regulated supply adjusts the bias as the sensor warms. A SPAD is biased a few volts beyond its breakdown voltage, and each one has a _quenching_ circuit that stops the avalanche after a click and re-arms the diode.
+
+For linear detectors (PIN photodiodes and APDs), a _transimpedance amplifier_ (TIA) converts the microamperes of photocurrent into a voltage. It must be fast enough to preserve a nanosecond pulse, which means a bandwidth of hundreds of megahertz, yet quiet enough not to bury a weak echo, and the two conflict, since noise grows with bandwidth. After the TIA the signal takes one of two routes. In most sensors, a _comparator_ produces a digital edge when the signal crosses the threshold, and the controller timestamps the edge, and often the falling edge too, since the time spent above threshold indicates the echo's strength. In _full-waveform_ sensors, a fast analogue-to-digital converter (ADC), sampling at around a gigasample per second, records the whole echo, and the controller fits the shape of each pulse, which separates overlapping returns and times them more precisely; survey scanners work this way.
+
+SPAD-based sensors integrate the whole receiver on one CMOS chip, often two chips stacked and bonded face to face: an array of SPADs with their quenching circuits on one layer, and on the other, beneath them, the TDCs and memory that accumulate each pixel's histogram of photon arrival times. The output of such a chip is already digital, and its manufacturing cost falls the way any chip's does with volume, which is a large part of why these sensors have become cheap.
+
+## Steering, power and housekeeping
+
+A spinning sensor has a brushless motor with a speed-control loop and an optical encoder that reports the head's angle to a fraction of a degree. Power and data must cross the rotating joint, either through a slip ring or contactlessly, with power transferred inductively and data by an optical or radio link. MEMS scanners instead have a mirror driver and a sensor of the mirror's position. Around these sit the less glamorous circuits on which safety and reliability depend: interlocks that stop the laser if the scanner stops, since a beam that is not moving concentrates its energy on one spot; heaters that clear frost from the window; detectors for dirt on the window; and temperature monitoring throughout.
+
+## The interface
+
+Points leave the sensor as UDP packets over Ethernet, at one hundred megabits or a gigabit per second, or, in cars, over the single-pair _automotive Ethernet_ standards. The same connector, or a separate one, carries the inputs for time synchronisation described [below](#clocks-and-synchronisation).
+
+## What changes for FMCW
+
+An FMCW sensor shares the controller, clock, scanner and interface, but its optical and receiving electronics are those of a coherent radio, and considerably more demanding.
+
+- **The laser** must be _narrow-linewidth_. Its frequency must stay coherent over the whole round trip, since the echo is compared with light emitted a round-trip time later; the laser's random phase drift over that interval smears the beat into a broad peak. The time over which a laser of linewidth $\Delta\nu$ stays coherent is about $1/(\pi\Delta\nu)$, so a round trip to $300$ m, of $2\ \mu$s, needs a linewidth below about $160$ kHz, where an ordinary semiconductor laser's is megahertz.
+- **The chirp** is produced by modulating the laser's drive current, or with a separate optical modulator, under the control of a digital-to-analogue converter driven by the controller. No laser chirps perfectly linearly, and a curved chirp spreads each target's beat over a range of frequencies. So a small fraction of the light is sent through a _reference interferometer_, two paths of a known difference in length, whose own beat records the chirp actually produced, and the measured signal is resampled to undo the nonlinearity.
+- **The optics** include an optical amplifier, an erbium-doped fibre amplifier or a semiconductor optical amplifier, to raise the transmitted power, and a _circulator_ that sends outgoing light to the target and returning light to the receiver through the same aperture.
+- **The receiver** mixes the echo with the local oscillator in an _optical hybrid_ and detects the result with _balanced photodiodes_, pairs whose outputs are subtracted, which cancels the local oscillator's own intensity noise and keeps the beat term of [](eq:beat). Two such pairs, a quarter of a cycle apart, give the in-phase and quadrature components of the beat, which reveal its sign and so distinguish a target approaching from one receding.
+- **The digitisation** is heavy: each channel's beat signal is sampled at hundreds of megasamples per second, and the controller computes a Fourier transform for every measurement and finds its peaks. This processing load, far larger than timing an edge, is why FMCW sensors depend on powerful FPGAs or dedicated ASICs.
+
+Much of this optical circuitry can be built in _silicon photonics_, with waveguides, splitters and detectors fabricated on a chip like an integrated circuit, which is how FMCW sensors are being made small and cheap enough for cars.
+
+# Sensors on the market
+
+LiDARs span five orders of magnitude in price, and the differences are in range, resolution, robustness and certification rather than in principle. The examples below illustrate the spread; prices are approximate retail prices at the time of writing, and they change quickly.
+
+| Class | Example | Principle | Approximate price | Output and synchronisation |
+| --- | --- | --- | --- | --- |
+| Proximity chip | ST VL53L1X | SPAD time of flight, one zone | a few dollars | I²C; none |
+| Single-point rangefinder | Benewake TF-Luna | time of flight, 8 m | about \$25 | UART or I²C; none |
+| 2D scanner | Slamtec RPLIDAR A1 | triangulation, 12 m, 360° | about \$100 | serial over USB; none |
+| 3D robotics | Livox Mid-360 | time of flight, non-repetitive scan | about \$1,000 | Ethernet, built-in IMU; PTP, gPTP, GPS |
+| 3D spinning | Velodyne VLP-16, Ouster OS series | 16 to 128 channels | thousands of dollars | Ethernet; GPS PPS, PTP, sync pulses |
+| Automotive | Hesai AT128 | 128-channel hybrid solid state | hundreds of dollars in volume | Ethernet |
+| Coherent | Aeva Aeries II | FMCW with per-point velocity | not published | Ethernet |
+| Survey | RIEGL VUX series | full-waveform, MHz pulse rates | by quotation | Ethernet; GNSS and IMU integration, camera control |
+
+At the bottom, the **proximity sensors** in phones and robots are single chips holding a VCSEL, a small SPAD array and the timing electronics, reporting one distance or a coarse grid of a few zones over I²C, with a range of a few metres. **Single-point rangefinders** such as the [TF-Luna](https://www.robotshop.com/products/benewake-tf-luna-8m-lidar-distance-sensor) add optics and a microcontroller to measure one distance up to about $8$ m at up to a few hundred readings a second, and are used for altitude-hold in drones and for simple obstacle detection.
+
+**Hobbyist 2D scanners** such as the [RPLIDAR A1](https://www.waveshare.com/product/robotics/rplidar-a1.htm) spin a single beam to map a plane, enough for a robot vacuum or a student robot to build a 2D map. Many of them, the A1 included, do not measure time of flight at all but _triangulate_: a small camera beside the laser sees the laser spot, and the spot's position in the image, which shifts with distance, gives the range. Triangulation needs no picosecond electronics, but its error grows with the square of the range, which limits it to about ten metres.
+
+**3D sensors for robotics** begin around a thousand dollars. The [Livox Mid-360](https://livox-wiki-en.readthedocs.io/en/latest/tutorials/new_product/mid360/mid360.html) scans a non-repetitive pattern over $360°$ horizontally and $59°$ vertically, sends points over Ethernet and includes an IMU, convenient for the LiDAR–inertial odometry described later in the course. Above it sit the spinning multi-beam sensors. The Velodyne VLP-16 "Puck", with sixteen channels, launched in 2016 at about \$8,000 and was cut to about \$4,000 in 2018, and remains one of the most common sensors in research datasets. Velodyne merged with Ouster in 2023; Ouster's OS series, built on SPAD receiver chips, offers 32 to 128 channels in short-, medium- and long-range variants, with prices generally quoted rather than listed.
+
+**Automotive sensors** are a different market. A sensor built into a production car must survive a decade of heat, cold, vibration and car washes, meet functional-safety standards, and be made by the hundred thousand, and in such volumes prices have fallen remarkably: Hesai has said its next-generation automotive sensor would sell for under \$200, half the price of its AT128, while the same AT128 bought singly as a development unit costs thousands. **Coherent sensors** such as Aeva's Aeries II bring FMCW, with a velocity for every point, to the same market. At the top, **survey scanners** such as RIEGL's VUX series, mounted on aircraft and drones to map terrain and forests, digitise full waveforms at pulse rates of over a megahertz and are sold as part of systems integrated with survey-grade GNSS receivers and IMUs.
+
+## Clocks and synchronisation
+
+Communications radios depend on precise frequency references because their transmitter and receiver are separate devices with separate oscillators, which must agree on frequency and phase before a signal can be decoded. A LiDAR is _monostatic_: its transmitter and receiver sit in one box and share one clock, so every range is a comparison of the sensor with itself. Ranging therefore needs no external reference, and every sensor carries its own clock. As shown [above](#the-reference-clock), even an inaccurate crystal costs only millimetres; what ranging needs is low jitter, which is internal.
+
+The same holds for coherence in an FMCW sensor. The local oscillator is a tap of the very laser that produced the outgoing light, so the measurement is self-referenced, and what matters is the laser's coherence over one round trip, a property of the laser alone. No coherence with any other device is needed, or possible.
+
+Where an external time source matters is in _timestamps_. A point is only useful once placed in the world, which requires knowing where the vehicle was when the point was measured, and that pose comes from other sensors (an IMU, wheel encoders, a GNSS receiver, cameras) with clocks of their own. A free-running crystal off by $20$ parts per million drifts by $1.7$ s a day, so two devices left to their own clocks quickly disagree. And small disagreements are costly: a timing error of one millisecond on a vehicle moving at $30$ m/s misplaces every point by $3$ cm, and on a vehicle turning at $30°$ per second it rotates the scan by $0.03°$, which is another $2.6$ cm at $50$ m. Deskewing, odometry and fusion, all described later in the course, depend on timestamps that agree across sensors to well under a millisecond.
+
+Sensors therefore accept an external time source in one or more of three ways.
+
+- **GPS time** arrives as two signals from a GNSS receiver: a _pulse per second_ (PPS), an electrical edge marking the start of each second to within tens of nanoseconds, and a serial message (an NMEA `$GPRMC` sentence) saying which second it was. The VLP-16, for instance, takes both through its interface box, and stamps its packets with time since the top of the hour.
+- **PTP** (the Precision Time Protocol, IEEE 1588) synchronises clocks over the Ethernet network itself: a grandmaster clock exchanges timestamped messages with each device, which measures and removes the network's delay, reaching microsecond agreement or better when the network hardware timestamps the messages. Its generalised profile, gPTP (IEEE 802.1AS), is the one used on automotive Ethernet networks. Ouster's and Livox's sensors support PTP, and the [Mid-360](https://livox-wiki-en.readthedocs.io/en/latest/tutorials/new_product/common/time_sync.html) accepts PTP, gPTP or GPS, preferring PTP when more than one is present.
+- **Sync pulses** in and out tie the sensor to other hardware directly. A spinning sensor can be _phase-locked_ to the PPS, so that it points in a chosen direction at the top of each second and every scan begins at a predictable instant; several LiDARs can then be locked so that their scans align, and a camera can be triggered at the moment the LiDAR's beam sweeps through the camera's field of view, so that the two observe the same instant. [Ouster's sensors](https://docs.ouster.com/sensor-docs/time-synchronization) can both accept a sync pulse and emit one derived from PTP.
+
+Without any of these, a sensor stamps its data with its own time since power-on, and the computer receiving it must estimate the offset, at best by stamping packets on arrival, which adds the jitter of the network and the operating system. That is adequate for a hobby robot and inadequate for a car. In short, a LiDAR does not need an external reference to measure distance, but a system built around LiDAR needs one to know _when_ each distance was measured.
 
 # The structure of the data
 

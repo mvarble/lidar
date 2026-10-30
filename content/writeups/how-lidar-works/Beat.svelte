@@ -82,7 +82,7 @@
                 viewBox="-70 -72 205 144"
                 class="disc"
                 role="img"
-                aria-label="Phasor diagram: drag to choose the echo's amplitude and phase"
+                aria-label="Phasor diagram: click or drag to place the echo's phasor"
                 onpointerdown={down}
                 onpointermove={move}
                 onpointerup={up}
@@ -120,15 +120,14 @@
                 <line
                     x1="0"
                     y1="0"
-                    x2={tip[0] * 0.96}
-                    y2={tip[1] * 0.96}
+                    x2={tip[0]}
+                    y2={tip[1]}
                     class="echo"
                     marker-end="url(#beat-arrow-echo)"
                 />
                 <line x1={R} y1="0" x2={R + tip[0]} y2={tip[1]} class="echo copy" />
                 <line x1="0" y1="0" x2={R + tip[0]} y2={tip[1]} class="sum" />
                 <circle cx={R + tip[0]} cy={tip[1]} r="3" class="sum-tip" />
-                <circle cx={tip[0]} cy={tip[1]} r="7" class="handle" />
             </svg>
             <label>
                 <span>amplitude {a.toFixed(2)}</span>
@@ -173,16 +172,16 @@
         </li>
     </ul>
     <figcaption>
-        Two waves making 24 and 20 cycles in the window shown. Drag the echo's phasor, or use the
-        sliders, to set its amplitude (the arrow's length, relative to the local oscillator's) and
-        its phase (the arrow's angle). The amplitude sets how deep the beat swells; the phase slides
-        the swells, whose peaks are marked, along in time; and the number of swells never changes,
-        because it is the difference of the two frequencies. In the diagram, the waves drifting in
-        and out of step amount to the echo's arrow turning once per beat relative to the local
-        oscillator's, so the tip of their sum (the thin dark arrow) runs round the dashed circle,
-        and its length, which sets the power, swings between 1 − a and 1 + a. In a real FMCW sensor
-        the optical waves make about 200 million million cycles a second, and the beat is between a
-        few and a few hundred megahertz.
+        Two waves making 24 and 20 cycles in the window shown. Click or drag anywhere in the diagram
+        to place the tip of the echo's phasor, or use the sliders, to set its amplitude (the arrow's
+        length, relative to the local oscillator's) and its phase (the arrow's angle). The amplitude
+        sets how deep the beat swells; the phase slides the swells, whose peaks are marked, along in
+        time; and the number of swells never changes, because it is the difference of the two
+        frequencies. In the diagram, the waves drifting in and out of step amount to the echo's
+        arrow turning once per beat relative to the local oscillator's, so the tip of their sum (the
+        thin dark arrow) runs round the dashed circle, and its length, which sets the power, swings
+        between 1 − a and 1 + a. In a real FMCW sensor the optical waves make about 200 million
+        million cycles a second, and the beat is between a few and a few hundred megahertz.
     </figcaption>
 </figure>
 
@@ -242,12 +241,6 @@
         fill: none;
         stroke: var(--series-3);
         stroke-dasharray: 3 3;
-    }
-    .handle {
-        fill: var(--series-2);
-        fill-opacity: 0.25;
-        stroke: var(--series-2);
-        cursor: grab;
     }
     .axis {
         stroke: var(--rule);
