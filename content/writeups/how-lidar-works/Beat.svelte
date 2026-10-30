@@ -68,7 +68,7 @@
         follow the individual cycles reports only that slow swell, the beat. The echo's smaller
         amplitude makes the swell shallower and its phase shifts where the swell peaks, but neither
         changes how often it swells. In a real FMCW sensor the optical waves make about 200 million
-        million cycles a second, and the beat is in the megahertz to hundreds of megahertz.
+        million cycles a second, and the beat is between a few and a few hundred megahertz.
     </figcaption>
 </figure>
 
