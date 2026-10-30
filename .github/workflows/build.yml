@@ -1,0 +1,84 @@
+# Builds the site on every push and pull request, with the version of
+# @mvarble/mesearch the project depends on, and keeps the result as an artifact.
+# Pushes to main also deploy it to GitHub Pages, which needs the repository's
+# Settings > Pages > Source set to "GitHub Actions".
+name: build
+
+on:
+    push:
+    pull_request:
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            # For configure-pages, which asks where the site is served from.
+            pages: read
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  # The whole history: documents without dates take them from it.
+                  fetch-depth: 0
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+                  package-manager-cache: false
+            - name: Install dependencies
+              run: |
+                  if [ -f pnpm-lock.yaml ]; then
+                      npm install --global pnpm
+                      pnpm install --frozen-lockfile
+                  elif [ -f yarn.lock ]; then
+                      corepack enable
+                      case "$(yarn --version)" in
+                          1.*) yarn install --frozen-lockfile ;;
+                          *) yarn install --immutable ;;
+                      esac
+                  elif [ -f package-lock.json ]; then
+                      npm ci
+                  else
+                      npm install
+                  fi
+            - uses: actions/configure-pages@v6
+              id: pages
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+            # `--no`: the project's own mesearch, never one fetched from the registry.
+            # A build that will be deployed takes its URL prefix from Pages:
+            # '/<repository>', or nothing under a custom domain.
+            - name: Build the site
+              env:
+                  DEPLOYING: ${{ steps.pages.outcome == 'success' }}
+                  BASE_PATH: ${{ steps.pages.outputs.base_path }}
+              run: |
+                  if [ "$DEPLOYING" = true ]; then
+                      npx --no -- mesearch build --base "${BASE_PATH:-/}"
+                  else
+                      npx --no -- mesearch build
+                  fi
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: site
+                  path: build/
+            - uses: actions/upload-pages-artifact@v5
+              if: steps.pages.outcome == 'success'
+              with:
+                  path: build/
+
+    deploy:
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        needs: build
+        runs-on: ubuntu-latest
+        permissions:
+            pages: write
+            id-token: write
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        # One deployment at a time, and never abandon one halfway.
+        concurrency:
+            group: pages
+            cancel-in-progress: false
+        steps:
+            - uses: actions/deploy-pages@v5
+              id: deployment
