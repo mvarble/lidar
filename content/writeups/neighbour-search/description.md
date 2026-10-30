@@ -1,0 +1,1 @@
+Why neighbour queries dominate point-cloud processing, and the structures that answer them quickly: voxel grids and spatial hashing (with voxel downsampling), k-d trees, octrees and Morton codes, and the free neighbourhoods of a range image.

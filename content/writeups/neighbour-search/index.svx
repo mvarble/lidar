@@ -1,0 +1,111 @@
+---
+title: Spatial data structures and neighbour search
+created: 2026-10-30
+depends_on: [how-lidar-works]
+---
+
+<script>
+    import KdTree from './KdTree.svelte';
+</script>
+
+Nearly every algorithm that processes a point cloud asks, again and again, which points lie near a given point. Estimating a surface normal needs the neighbours of every point; clustering joins points whose neighbours overlap; registration pairs each point of one scan with the nearest point of another, tens of times per scan. Answered naively, by measuring the distance to every point, a query costs $O(N)$ and a query for each of $N$ points costs $O(N^2)$, which for a single scan of $10^5$ points is $10^{10}$ distance computations, far too many for a sensor that delivers ten scans a second. This writeup describes the data structures that make neighbour queries fast, the voxel grid, the k-d tree and the octree, together with the neighbourhoods a range image gives for free, and the voxel downsampling that the grid makes possible and that nearly every pipeline begins with.
+
+This writeup builds on [How LiDAR works](../how-lidar-works/), whose account of [range images and point clouds](../how-lidar-works/#range-images-and-point-clouds) and of [sampling density](../how-lidar-works/#sampling-density) explains why point clouds need these structures and why a fixed neighbourhood radius behaves differently near the sensor and far from it.
+
+# Neighbour queries
+
+Two kinds of query recur. Given a query point $\bfq$ and a cloud $P = \{\bfp_1, \dots, \bfp_N\}$ in $\bbR^3$,
+
+- a **k-nearest-neighbour** (kNN) query returns the $k$ points of $P$ closest to $\bfq$, and
+- a **radius** (or fixed-radius, or ball) query returns every point within distance $\varepsilon$ of $\bfq$.
+
+The two behave differently on LiDAR data. A kNN query always returns $k$ points, but on the sparse far side of a scan they may be metres apart and describe no local surface at all. A radius query returns points that are genuinely local, but its result may be empty far from the sensor and enormous close to it. Many algorithms therefore combine them, taking up to $k$ neighbours within a radius $\varepsilon$, a _hybrid_ query.
+
+An _approximate_ nearest-neighbour query relaxes the problem, returning a point within a factor $1 + \epsilon$ of the true nearest distance. For the three-dimensional data of LiDAR, exact queries are usually fast enough, and approximation matters mostly for the high-dimensional descriptors of the next writeup.
+
+# Voxel grids
+
+The simplest structure divides space into cubes of side $\delta$, called _voxels_, and records which points fall in each. Point $\bfp$ lies in the voxel with integer coordinates
+
+$$
+	\bfv(\bfp) = \big(\lfloor p_x / \delta \rfloor, \lfloor p_y / \delta \rfloor, \lfloor p_z / \delta \rfloor\big).
+$$
+
+A dense three-dimensional array of voxels would waste memory on the empty space that makes up nearly all of a LiDAR scene, so the occupied voxels are stored in a hash table keyed by $\bfv$, a _spatial hash_. A common hash function multiplies the three integer coordinates by large primes and combines them with exclusive or. Building the table costs $O(N)$.
+
+To answer a radius query with $\varepsilon \le \delta$, it is enough to look in the voxel containing $\bfq$ and its $26$ neighbours, since any point within $\varepsilon$ of $\bfq$ must lie in one of them, and then to check the distances of the points found. When the number of points per voxel is bounded, a query costs $O(1)$. That bound is the weakness of the grid: a single voxel size cannot suit both the dense near field of a scan and its sparse far field, and a kNN query has no natural stopping point, since the $k$ nearest points may lie many voxels away. Voxel hash maps are nevertheless the structure of choice for maps that are updated continuously, since inserting and deleting points is cheap; the KISS-ICP odometry system, for instance, keeps its whole local map in one [](cite:vizzo2023).
+
+## Voxel downsampling
+
+The most common use of a voxel grid is to thin a cloud. _Voxel downsampling_ (Open3D's `voxel_down_sample`, PCL's `VoxelGrid` filter) replaces all the points in each occupied voxel by a single representative, usually their centroid, sometimes the point nearest the centroid, or simply the first point to arrive. The output has at most one point per voxel, so its density is bounded by about one point per $\delta^2$ of surface. That evens out the density of a LiDAR scan: the near field, where points are crowded, is thinned heavily, and the far field, where they are sparse, is barely touched. It also reduces the cost of every later step, often by an order of magnitude, and averages out some range noise. A voxel size of $0.1$ to $0.5$ m is typical for registration and mapping in outdoor scenes.
+
+```python
+import numpy as np
+
+def voxel_downsample(points, voxel):
+    """Replace the points in each occupied voxel by their centroid."""
+    keys = np.floor(points / voxel).astype(np.int64)
+    _, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    sums = np.zeros((len(counts), points.shape[1]))
+    np.add.at(sums, inverse.ravel(), points)
+    return sums / counts[:, None]
+```
+
+Sorting the keys makes this $O(N \log N)$; a hash table makes it $O(N)$. Other columns, such as intensity, can be averaged in the same way, though a label or a ring index cannot be averaged and is taken from one of the points instead.
+
+# k-d trees
+
+A _k-d tree_ [](cite:bentley1975) is a binary tree that recursively splits space with axis-aligned planes. Each internal node holds a point and an axis, and splits the points beneath it into those below that point's coordinate on that axis and those above it. Construction chooses a splitting axis, either cycling through $x$, $y$, $z$ or taking the axis along which the points are most spread, splits at the median so that the tree stays balanced, and recurses on each half. Finding a median takes linear time, so construction costs $O(N \log N)$. In practice the recursion stops when a node holds fewer than some _leaf size_, around ten to fifty points, which are stored in a list and scanned directly, since that is faster than descending further.
+
+## Nearest-neighbour search
+
+A nearest-neighbour search descends the tree from the root, at each node going to the side of the splitting plane that contains $\bfq$, until it reaches a leaf; the nearest point found there is a first candidate, at distance $d$. It then backtracks up the path. At each node, the other side of the splitting plane can hold a nearer point only if the plane is closer to $\bfq$ than $d$, that is, if the ball of radius $d$ about $\bfq$ crosses the plane. If it does not, the whole subtree on the far side is _pruned_ without being examined; if it does, the search descends into it as well, possibly finding a nearer candidate and shrinking $d$. The search ends when the root has been revisited.
+
+```python
+def nearest(node, q, best=(None, float('inf'))):
+    """Nearest point to q in the subtree under node, as (point, squared distance)."""
+    if node is None:
+        return best
+    d2 = np.sum((node.point - q) ** 2)
+    if d2 < best[1]:
+        best = (node.point, d2)
+    diff = q[node.axis] - node.point[node.axis]
+    near, far = (node.low, node.high) if diff < 0 else (node.high, node.low)
+    best = nearest(near, q, best)
+    if diff ** 2 < best[1]:  # the ball around q crosses the splitting plane
+        best = nearest(far, q, best)
+    return best
+```
+
+For points spread reasonably evenly in a space of low dimension, the expected cost of a query is $O(\log N)$ [](cite:friedman1977), since only a handful of cells near the query must be examined, as the figure below shows. A kNN query keeps the $k$ best candidates in a bounded priority queue and prunes against the distance of the $k$-th; a radius query prunes against $\varepsilon$ directly.
+
+<KdTree />
+
+The k-d tree is the workhorse of point-cloud processing: PCL and Open3D both build on k-d tree libraries (FLANN and nanoflann). It adapts to the varying density of a scan, since it splits where the points are, and it answers kNN queries naturally. Its weaknesses are that it must be rebuilt, at $O(N \log N)$, when points are added or removed, since insertions unbalance it, and that its advantage fades in high dimensions, where the ball around a query crosses almost every splitting plane; above about twenty dimensions a k-d tree is little better than brute force, and approximate methods take over. Systems that maintain a map incrementally either rebuild their tree periodically, use an incremental variant that rebalances partially, or use a voxel hash instead.
+
+# Octrees
+
+An _octree_ divides a cubic region of space into eight equal octants, each of those into eight more, and so on, refining only the octants that contain points, down to a minimum size or until each holds few enough points. Unlike a k-d tree it splits space at fixed positions rather than at the data, so its cells align with a voxel grid at every level, and it can be thought of as a voxel grid at many resolutions at once.
+
+That multi-resolution structure is what octrees are used for. A query can stop at a coarse level when a coarse answer suffices; two clouds stored in octrees with the same root can be compared cell by cell to detect change; and empty space is represented by a single large cell rather than many small ones. OctoMap [](cite:hornung2013), the standard library for three-dimensional occupancy maps, stores a probability of occupancy in each cell of an octree and merges children whose probabilities agree, so that large uniform regions cost almost nothing. Point-cloud compression schemes encode the occupancy of each node's eight children as one byte and compress the resulting stream.
+
+Octrees are often stored without pointers, as a sorted array of _Morton codes_. The Morton code of a voxel interleaves the bits of its three integer coordinates, $z_n y_n x_n \dots z_1 y_1 x_1$, so that sorting voxels by their codes visits them in a space-filling Z-shaped order in which every octree cell at every level is a contiguous run of the array. This _linear octree_ is cache-friendly and easy to build in parallel, which makes it popular on GPUs.
+
+# Neighbours in the range image
+
+An organised cloud, one still laid out as the sensor's range image, gives every point a set of candidate neighbours at no cost: the pixels above, below, left and right of it, or within a small window. Looking them up costs $O(1)$ with no structure to build, which is why the fastest algorithms for clustering and for normal estimation on a single scan work in the range image.
+
+The neighbourhood it gives is a neighbourhood in direction, not in space, and the two differ in two ways. Adjacent pixels on either side of a depth discontinuity, say the edge of a car with a wall behind it, are adjacent in the image but metres apart in space, so range-image algorithms must check the actual distances or angles between pixel neighbours before treating them as near. And the spacing of pixel neighbours grows with range, as [How LiDAR works](../how-lidar-works/#sampling-density) explains, so a window of fixed size in pixels covers a few centimetres of a near surface and metres of a far one. Once several scans are merged or the cloud has been transformed and filtered, the image layout is lost and a spatial structure is needed again.
+
+# Choosing a structure
+
+The choice depends on the query and on how the data changes.
+
+| Structure        | Build         | Query                        | Updates                | Typical use                                      |
+| ---------------- | ------------- | ---------------------------- | ---------------------- | ------------------------------------------------ |
+| Voxel hash       | $O(N)$        | $O(1)$ radius, poor kNN      | cheap                  | downsampling, local maps for odometry            |
+| k-d tree         | $O(N \log N)$ | $O(\log N)$ expected         | rebuild                | normals, ICP correspondences, clustering         |
+| Octree           | $O(N \log N)$ | $O(\log N)$, multi-resolution | cheap insertion        | occupancy maps, change detection, compression    |
+| Range image      | none          | $O(1)$, pixel window         | one scan only          | single-scan clustering, normals, segmentation    |
+
+A typical pipeline uses several: it voxel-downsamples each incoming scan, builds a k-d tree over it to compute normals, keeps its local map in a voxel hash or an incrementally updated tree for registration, and stores a long-term occupancy map in an octree. The next writeup uses these neighbourhoods to estimate the local geometry of a cloud: to remove its outliers and compute its normals and descriptors.

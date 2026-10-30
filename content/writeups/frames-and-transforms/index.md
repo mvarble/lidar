@@ -58,7 +58,7 @@ $$
 	q = \cos\tfrac{\theta}{2} + \sin\tfrac{\theta}{2}\,(k_1 \rmi + k_2 \rmj + k_3 \rmk),
 $$
 
-which rotates a vector $\bfv$, written as the pure quaternion $v_1\rmi + v_2\rmj + v_3\rmk$, by $\bfv \mapsto q \bfv q^{*}$, where $q^{*}$ negates the three imaginary parts. Composing rotations is multiplying quaternions, and the corresponding matrix is
+which rotates a vector $\bfv$, written as the pure quaternion $v_1\rmi + v_2\rmj + v_3\rmk$, by $\bfv \mapsto q \bfv q^{\ast}$, where $q^{\ast}$ negates the three imaginary parts. Composing rotations is multiplying quaternions, and the corresponding matrix is
 
 $$
 	R(q) = \begin{pmatrix}
