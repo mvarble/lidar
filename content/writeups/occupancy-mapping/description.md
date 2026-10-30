@@ -1,0 +1,1 @@
+Maps of free, occupied and unknown space: the occupancy grid and its log-odds update, the inverse sensor model of a LiDAR beam, Amanatides–Woo ray traversal, OctoMap, removing moving objects from point maps, and signed distance fields.

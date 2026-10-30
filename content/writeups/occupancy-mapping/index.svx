@@ -1,0 +1,94 @@
+---
+title: Occupancy mapping and ray casting
+created: 2026-10-30
+depends_on: [lidar-odometry-and-slam]
+---
+
+<script>
+    import Occupancy from './Occupancy.svelte';
+</script>
+
+A point cloud records where surfaces were seen. It does not record where space was seen to be empty, and that is the information a vehicle or a robot needs most: before planning a path through a region, it must know that the region is free, not merely that no points were found there. A LiDAR measures free space as surely as it measures surfaces, because every beam that reaches a surface has passed through empty space on the way. _Occupancy mapping_ turns this into a map in which every cell of space is occupied, free or unknown, with a probability for each. This writeup derives the occupancy grid and its update in log-odds, describes the ray traversal that applies each beam to the grid, the octree that makes such maps practical in three dimensions, and the use of the same reasoning to remove moving objects from point maps.
+
+This writeup builds on [LiDAR odometry and SLAM](../lidar-odometry-and-slam/), since an occupancy map is built from scans whose poses are known, and recalls the [occlusion](../how-lidar-works/#occlusion) that makes free space and unknown space differ. Its standard reference is [](cite:thrun2005).
+
+# Occupancy grids
+
+An _occupancy grid_ [](cite:elfes1989) divides space into cells, squares in two dimensions or voxels in three, and models each cell $m_i$ as either occupied or free. Given the scans $z_{1:t}$ and the poses $x_{1:t}$ at which they were taken, the map stores for each cell the probability $p(m_i \mid z_{1:t}, x_{1:t})$ that it is occupied. Two assumptions make this tractable: that cells are independent of one another, so that each is estimated separately, and that the world is static, so that each measurement is a fresh, independent observation of an unchanging map. Neither is exactly true, but together they reduce mapping to a per-cell computation.
+
+## The update in log-odds
+
+For one cell, Bayes' rule and the assumption that measurements are independent given the cell's state give a recursive update. Writing the result in terms of the _log-odds_
+
+$$
+	l(p) = \log\frac{p}{1 - p},
+$$
+
+which maps probabilities in $(0, 1)$ to the whole real line, the update becomes a sum:
+
+$$
+	l_t = l_{t-1} + l\big(p(m_i \mid z_t, x_t)\big) - l_0, @tag(log-odds)
+$$
+
+where $l_0 = l(p(m_i))$ is the log-odds of the prior, usually $0$ for a prior of one half. The middle term is the _inverse sensor model_: the probability that the cell is occupied in light of the single measurement $z_t$ alone. Turning products of probabilities into sums of log-odds makes the update one addition per cell, numerically stable, and easy to parallelise. The probability is recovered when needed as $p = 1 - 1/(1 + e^{l})$.
+
+To see where [](eq:log-odds) comes from, apply Bayes' rule to the cell and to its complement and divide the two. The likelihood of the newest measurement $p(z_t \mid m_i)$ appears in both and is converted, by Bayes' rule again, into the inverse sensor model divided by the prior; the factors that do not depend on $m_i$ cancel in the ratio; and taking logarithms turns the remaining product of odds into the sum above [](cite:thrun2005).
+
+## The inverse sensor model for a LiDAR beam
+
+A beam from the sensor at $\bfo$ that returns at the point $\bfp$ says three things. The cell containing $\bfp$ probably holds a surface. The cells between $\bfo$ and $\bfp$ were crossed by the beam, so they are probably free. The cells beyond $\bfp$ were not observed, and are not updated. A beam that returns nothing, within the sensor's range, says that the cells along its whole length up to that range are probably free, though since absorbing or mirror-like surfaces also return nothing, many systems treat such beams cautiously or ignore them. The inverse sensor model therefore assigns a positive log-odds increment $l_{\mathrm{occ}}$ to the endpoint cell and a negative one $l_{\mathrm{free}}$ to the cells traversed: for instance $p = 0.7$ and $p = 0.4$, or $l_{\mathrm{occ}} \approx 0.85$ and $l_{\mathrm{free}} \approx -0.4$. Free-space evidence is usually weaker than occupied evidence, since a beam can graze past a thin obstacle without hitting it.
+
+## Clamping
+
+If log-odds were allowed to grow without bound, a cell observed occupied a thousand times would need a thousand observations of free space to change its mind, and the map could not keep up with a world that changes. Clamping the log-odds to an interval $[l_{\min}, l_{\max}]$, say $\pm 3.5$, corresponding to probabilities of about $0.03$ and $0.97$, keeps every cell able to change within a few observations, at the small cost of never being entirely certain. Clamping also allows the octree compression described below, since cells at the bounds can be merged.
+
+# Ray traversal
+
+Updating a grid with a scan means visiting, for each beam, every cell the beam passes through. A scan has a hundred thousand beams and each crosses tens to hundreds of cells, so this traversal must be exact and very fast. Sampling points along the ray at fixed intervals is neither: it skips cells that the ray clips at a corner and visits others twice. The standard algorithm is that of Amanatides and Woo [](cite:amanatides1987), a _digital differential analyser_ that steps from cell to cell in exactly the order the ray enters them, with a few additions per step.
+
+Parametrise the ray as $\bfo + t\,\bfd$. For each axis, the algorithm keeps $t_{\max}$, the value of $t$ at which the ray crosses the next cell boundary along that axis, and $t_\Delta$, the change in $t$ needed to cross one whole cell along it, which is $\delta / |d|$ for a cell size $\delta$ and direction component $d$. At each step, the axis with the smallest $t_{\max}$ is the one whose boundary the ray crosses next: the algorithm moves one cell along that axis and adds its $t_\Delta$ to its $t_{\max}$.
+
+```python
+def traverse(origin, end, cell):
+    """Integer indices of every grid cell the segment from origin to end passes through."""
+    d = end - origin
+    length = np.linalg.norm(d)
+    d = d / length
+    idx = np.floor(origin / cell).astype(int)
+    last = np.floor(end / cell).astype(int)
+    step = np.where(d > 0, 1, -1)
+    with np.errstate(divide='ignore'):
+        t_max = np.where(d != 0, ((idx + (step > 0)) * cell - origin) / d, np.inf)
+        t_delta = np.where(d != 0, cell / np.abs(d), np.inf)
+    cells = [tuple(idx)]
+    while not np.array_equal(idx, last) and t_max.min() <= length:
+        axis = np.argmin(t_max)
+        idx[axis] += step[axis]
+        t_max[axis] += t_delta[axis]
+        cells.append(tuple(idx))
+    return cells
+```
+
+The cost is proportional to the number of cells crossed, $O(r / \delta)$ for a ray of length $r$. In two dimensions Bresenham's line algorithm serves the same purpose on integer grids. Even so, ray casting dominates the cost of occupancy mapping, and large systems reduce it by downsampling beams, by merging the free-space updates of many rays that cross the same cell within one scan so that each cell is updated once, and by running the traversal on a GPU.
+
+<Occupancy />
+
+# Occupancy in three dimensions
+
+A dense three-dimensional grid of $0.1$ m voxels over a city block of $200 \times 200 \times 20$ m holds $8 \times 10^8$ cells, almost all of them empty or unknown. OctoMap [](cite:hornung2013) stores the same map in an [octree](../neighbour-search/#octrees), each node holding the log-odds of the region it covers. Its leaves are voxels at the finest resolution, but a node whose eight children have all reached the same clamped value is _pruned_: its children are deleted and it stands for all of them. Large free regions and the solid interiors of buildings therefore cost a few nodes each, and the map can be queried at any coarser resolution by stopping the descent early. Each inner node also stores the maximum occupancy of its children, so that a query for whether a large region is free, as a planner checking a path makes, can be answered without descending to the leaves.
+
+Driving systems more often use maps of two or two and a half dimensions. A bird's-eye occupancy grid records, for each ground cell, whether it is free, occupied or unknown, for planning on the road. An _elevation map_ records the height of the terrain in each cell, and its slope and roughness, for vehicles that leave the road. Both are updated with the same log-odds and the same ray traversal, projected onto the ground plane.
+
+# Removing moving objects
+
+A point map built by stacking registered scans keeps everything the sensor saw, including cars and pedestrians that were moving, which appear as long smeared trails of points, _ghosts_, through the map. A map meant for localisation or planning must not contain them, and occupancy reasoning removes them: a point on a moving object occupies a cell that later beams pass through, so the cell's log-odds fall, and points in cells that end up free are deleted. The figure above shows this in miniature, as the pedestrian's path is first marked occupied and then cleared.
+
+Ray casting through every cell for every scan is expensive, and many map-cleaning methods work in the range image instead, a check called _visibility_ or _free-space carving_: map points are projected into the range image of each scan, and a map point that projects onto a pixel whose measured range is clearly greater, so that the beam passed through the place where the point should have been, is marked dynamic. Grazing angles and the sparsity of distant pixels cause errors in both directions, and practical methods combine the check across many scans, at several resolutions, and with ground segmentation to avoid deleting the ground under a vehicle.
+
+# Signed distance fields
+
+Occupancy is not the only volumetric quantity a map can store. A _truncated signed distance field_ (TSDF) stores in each voxel the distance along the beam to the nearest observed surface, positive in front of it and negative behind, truncated to a band near the surface and averaged over observations with weights. The surface is the zero crossing of the field, which can be extracted as a mesh by the marching cubes algorithm, and its interpolation gives surfaces far smoother than the voxel size. TSDFs, introduced for depth cameras, are used for LiDAR surface reconstruction and for maps from which planners need distances to obstacles. They are updated by the same ray traversal, restricted to the truncation band around each return.
+
+# Summary
+
+An occupancy grid stores for each cell the probability that it is occupied, updated with each beam by adding the inverse sensor model in log-odds [](eq:log-odds): occupied at the endpoint, free along the way, untouched beyond, with clamping to keep the map responsive. Amanatides–Woo traversal visits exactly the cells each beam crosses at a cost proportional to their number, and octrees with pruning make three-dimensional occupancy maps compact. The same reasoning about free space removes moving objects from point maps. The next writeup turns to those moving objects themselves: following them over time with multi-object tracking.
