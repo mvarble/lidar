@@ -1,0 +1,1 @@
+Building odometry from registration, LOAM and feature-based odometry, LiDAR–inertial fusion, pose-graph SLAM and loop closure with an interactive example, place recognition with Scan Context, localisation in prior maps, and the ATE and KITTI drift metrics.

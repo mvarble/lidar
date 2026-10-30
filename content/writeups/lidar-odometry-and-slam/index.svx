@@ -1,0 +1,108 @@
+---
+title: LiDAR odometry and SLAM
+created: 2026-10-30
+depends_on: [scan-registration]
+---
+
+<script>
+    import PoseGraph from './PoseGraph.svelte';
+</script>
+
+A vehicle that knows how it has moved can stack its scans into a map, and a vehicle with a map can tell where it is by comparing its scans with it. _Odometry_ estimates the motion from one moment to the next; _localisation_ estimates the pose against a map built beforehand; and _simultaneous localisation and mapping_ (SLAM) builds the map and estimates the pose in it at the same time, with no prior map. This writeup assembles the registration methods of the previous writeup into these systems. It describes the structure of a LiDAR odometry pipeline, the feature-based LOAM family that defined the field, the fusion of LiDAR with an inertial measurement unit, the pose graph that turns drifting odometry into a consistent map once a place is revisited, the recognition of revisited places, and the standard ways such systems are evaluated.
+
+This writeup builds on [Scan registration](../scan-registration/), which supplies the alignment at the heart of every method here, and uses the [exponential map](../frames-and-transforms/#small-motions-and-the-tangent-space) and [deskewing](../frames-and-transforms/#motion-distortion-and-deskewing) of the writeup on coordinate frames. A thorough treatment of the estimation theory is [](cite:barfoot2017), and of the probabilistic view of mapping [](cite:thrun2005).
+
+# Odometry and drift
+
+Registering each scan to the one before gives the relative motion $\Delta T_k$ between them, and composing these gives the pose at every time,
+
+$$
+	T_{W,k} = T_{W,k-1}\,\Delta T_k = \Delta T_1\,\Delta T_2 \cdots \Delta T_k.
+$$
+
+Each $\Delta T_k$ carries a small error, and composition accumulates them without bound, so the estimated pose _drifts_. Rotational errors are the most harmful, since a small error in heading displaces every later position by an amount that grows with the distance travelled: a heading error of $0.1°$ becomes a lateral error of $1.7$ m after a kilometre. Good LiDAR odometry drifts by well under one percent of the distance travelled, but drift never vanishes, and only an absolute reference, such as a map, a satellite fix or the recognition of a place seen before, removes it.
+
+# A LiDAR odometry pipeline
+
+Most LiDAR odometry systems share one structure, and each step is one of the earlier writeups.
+
+1. **Predict** the new pose from a motion model: the last estimated velocity held constant, or the integration of an IMU.
+2. **Deskew** the incoming scan with the predicted motion over its sweep.
+3. **Downsample** it with a voxel grid, or extract a sparse set of features from it.
+4. **Register** it, starting from the prediction, against a _local map_ built from recent scans, rather than against the previous scan alone.
+5. **Update** the local map with the registered scan, and remove from it what has fallen far behind.
+
+Registering _scan-to-map_ rather than _scan-to-scan_ is the most important of these choices. The local map is denser than one scan and contains each surface as seen from many viewpoints, so correspondences are better, and since each scan is aligned with the accumulated map rather than chained to its predecessor, small errors do not compound as quickly. Maps are often maintained only at _keyframes_, when the vehicle has moved some distance or turned some angle, so that a stationary vehicle does not fill its map with copies of the same scan.
+
+# LOAM and feature-based odometry
+
+LOAM (LiDAR odometry and mapping) [](cite:zhang2014) is the system from which much of the field descends. Its central idea is to register not every point but two kinds of _feature_: points on sharp edges and points on flat surfaces.
+
+Features are found cheaply along each scan line. For a point $\bfp_i$ and a set $S$ of its neighbours on the same ring, about five on either side, the _smoothness_
+
+$$
+	c_i = \frac{1}{|S|\,\lVert\bfp_i\rVert} \Big\lVert \sum_{j \in S} (\bfp_i - \bfp_j) \Big\rVert
+$$
+
+is near zero where the ring crosses a flat surface, since the differences to neighbours on either side cancel, and large where it crosses an edge or a corner. Each ring is divided into a few sectors, and in each sector the points of highest $c$ are taken as _edge points_ and those of lowest $c$ as _planar points_, which spreads features evenly round the scan. Points are excluded where they are unreliable: on surfaces nearly parallel to the beam, and on the near side of a depth discontinuity, where the apparent edge is an occlusion boundary that moves as the sensor moves.
+
+Each edge point is registered to the line through its two nearest edge points $\bfa$ and $\bfb$ in the map, with residual equal to its distance to that line,
+
+$$
+	d_{\mathcal{E}} = \frac{\lVert (\bfp - \bfa) \times (\bfp - \bfb) \rVert}{\lVert \bfa - \bfb \rVert},
+$$
+
+and each planar point to the plane through three nearby planar points of the map, with residual its distance to the plane, as in point-to-plane ICP. The pose minimising the sum of these residuals is found by the Levenberg–Marquardt method. LOAM splits the work between two threads: a fast odometry, registering each sweep to the previous one at the sensor's rate, and a slower mapping step, registering to the accumulated map at about one hertz, whose result corrects the odometry.
+
+Using a few hundred features rather than tens of thousands of points made real-time operation possible on the computers of 2014, and edge and plane residuals remain in very wide use. LeGO-LOAM [](cite:shan2018) adapted the method to ground vehicles by segmenting the ground first and using it to estimate height, roll and pitch, and the edges to estimate the remaining position and heading, which is both faster and more robust on uneven terrain. Later systems showed that with careful deskewing and robust estimation, dense point-to-point or point-to-plane registration of a downsampled scan works as well without feature extraction [](cite:vizzo2023).
+
+# Fusing an IMU
+
+An inertial measurement unit measures angular velocity and linear acceleration hundreds of times a second. Integrating it predicts the motion between scans far better than a constant-velocity model, especially during sharp turns and braking, and it measures the motion within each sweep, so that deskewing no longer relies on a guess. In return, LiDAR registration corrects the IMU's biases, which otherwise make its integrated position drift quickly.
+
+The two are combined in one of two ways. _Loosely coupled_ systems run LiDAR odometry and IMU integration separately and fuse their pose estimates, typically in a Kalman filter. _Tightly coupled_ systems feed the raw residuals of registration into the same estimator as the IMU measurements. FAST-LIO [](cite:xu2021), for example, uses an _iterated error-state Kalman filter_: the IMU propagates the state (pose, velocity and IMU biases) between scans, and each scan's point-to-plane residuals against the map serve directly as the measurement that corrects it, the filter re-linearising those residuals several times per scan as an iterative solver would. Smoothing-based systems instead keep a window of recent states in a factor graph, of the kind described next, with the IMU's measurements between states summarised by _preintegration_. Tightly coupled LiDAR–inertial odometry is the current standard for robots and handheld scanners, and remains accurate through motion that defeats LiDAR alone.
+
+# Pose graphs
+
+Odometry, however good, drifts. Removing the drift needs information that relates the present to the distant past, and the structure that combines such information with odometry is the _pose graph_. Its nodes are the poses $T_1, \dots, T_n$ of the vehicle at its keyframes. Its edges are measurements of relative pose: between consecutive keyframes from odometry, and between distant keyframes whenever the vehicle recognises that it has returned to a place it has been before, a _loop closure_. Each edge $(i, j)$ carries a measured relative transform $Z_{ij}$ and an information matrix $\Omega_{ij}$, the inverse of its covariance, which says how far it can be trusted.
+
+SLAM then becomes nonlinear least squares. The residual of an edge is the difference between the relative pose predicted by the current estimates and the measured one, expressed as a six-vector through the logarithm map,
+
+$$
+	\bfe_{ij} = \operatorname{Log}\big(Z_{ij}^{-1}\,T_i^{-1}\,T_j\big), \qquad
+	\min_{T_1, \dots, T_n} \sum_{(i,j)} \bfe_{ij}\T\,\Omega_{ij}\,\bfe_{ij}. @tag(pose-graph)
+$$
+
+It is minimised by Gauss–Newton or Levenberg–Marquardt on the manifold: linearise each residual with respect to small perturbations of the poses, solve the resulting linear system for the perturbations, apply them through the exponential map, and repeat. The linear system is large but _sparse_, since each edge touches only two poses, and sparse Cholesky factorisation solves systems with many thousands of poses in milliseconds. The first pose is held fixed, since the cost is unchanged if every pose is moved together.
+
+<PoseGraph />
+
+The figure shows what a single loop closure does. Before it, the odometry edges are all satisfied exactly and the drift is invisible to the optimiser. The loop closure contradicts them, and the minimum of [](eq:pose-graph) distributes the contradiction over all the edges in proportion to their uncertainty, pulling the whole trajectory back into shape. After optimisation, every scan is re-projected using its corrected pose to rebuild the map.
+
+The pose graph is the simplest instance of a _factor graph_ [](cite:dellaert2017), in which variables (poses, velocities, IMU biases, landmarks) are joined by factors (odometry, IMU preintegration, loop closures, GPS fixes, priors from a map), each contributing a term to a least-squares cost. Libraries such as g2o, GTSAM and Ceres solve such problems, and incremental solvers update the solution as new factors arrive without starting again.
+
+## False loop closures
+
+A wrong loop closure is catastrophic. Where an odometry error bends the map a little, a loop closure claiming that two different places are the same, two identical stretches of motorway, two floors of a car park, pulls them on top of one another and destroys the map. Systems defend against this in layers: candidate loops must pass geometric verification by registration, with a good fitness and a low residual; candidates are checked for consistency with each other and with odometry before being accepted; and loop closure edges are given robust kernels or switchable weights in the optimisation, so that one that contradicts the rest can be discounted automatically.
+
+# Place recognition
+
+Before a loop can be verified it must be proposed: of all the places visited, which might the current scan have been taken at? Comparing the scan with every past scan by registration is far too slow, so each scan is summarised by a compact _global descriptor_, and candidates are retrieved by nearest-neighbour search among the descriptors.
+
+_Scan Context_ [](cite:kim2018) is a simple and widely used descriptor for LiDAR. The area around the sensor, out to some range, is divided into a polar grid of rings and sectors, typically $20$ rings by $60$ sectors, and each bin records the maximum height of the points in it. The result is a $20 \times 60$ matrix, an image of the surroundings' skyline as seen from above. Revisiting a place from a different heading rotates the scene about the sensor, which shifts the matrix's columns cyclically, so two Scan Contexts are compared by the best distance between their columns over all cyclic shifts, which also gives an estimate of the relative heading to start registration from. For fast retrieval, each matrix is summarised further by a _ring key_, the occupancy of each ring, which does not depend on heading and can be searched with a k-d tree; the few nearest candidates are then compared in full and the best is verified by ICP. Learned global descriptors, trained so that scans of the same place are close, have since improved recall, but Scan Context remains the common baseline.
+
+# Localisation against a prior map
+
+Most autonomous vehicles do not run full SLAM while driving. They localise in a high-definition map built and checked beforehand, which gives them a frame consistent across days and vehicles in which lanes, signs and rules of the road are annotated. Localisation registers each scan to the map, with NDT or ICP, starting from a prediction by odometry and the IMU, and fuses the result with the other sensors in a filter. Matching the intensities of the points as well as their geometry helps on featureless motorways, where lane markings may be the only structure. A satellite fix provides the coarse initial position, and the map then refines it to centimetres.
+
+# Evaluation
+
+Odometry and SLAM are evaluated against a ground-truth trajectory, from a survey-grade GNSS and inertial system or a motion-capture system, with two standard metrics.
+
+The _absolute trajectory error_ (ATE) first aligns the estimated trajectory with the ground truth by the rigid transform that best fits their positions, which is exactly the problem of [the Kabsch–Umeyama solution, %full of that writeup,](statement:writeups/scan-registration/kabsch) with the positions at matching times as correspondences, and then reports the root mean square of the remaining position errors. It measures the global consistency of the trajectory, and is the natural metric for SLAM.
+
+The _relative pose error_ (RPE) compares the estimated and true relative motions over segments of fixed length, and so measures drift independently of where along the trajectory it happened. The KITTI odometry benchmark [](cite:geiger2012) reports this as the average translational error, in percent of distance travelled, and the rotational error, in degrees per metre, over all segments from $100$ to $800$ m long. It is the natural metric for odometry.
+
+# Summary
+
+LiDAR odometry predicts, deskews, downsamples and registers each scan against a local map; LOAM and its descendants register edge and planar features, and dense methods register downsampled points; fusing an IMU, especially through tightly coupled filters or factor graphs, makes the estimate robust to fast motion. Odometry drifts, and a pose graph [](eq:pose-graph) removes the drift once loop closures, proposed by place recognition such as Scan Context and verified by registration, tie the present to the past. Vehicles with a prior map localise in it instead. The maps such systems build are of points; the next writeup describes maps of a different kind, which record not where surfaces were seen but which space is occupied, which is free, and which is unknown.
