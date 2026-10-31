@@ -1,0 +1,1 @@
+Scaled dot-product attention, multi-head attention, the transformer block with residual connections and layer normalisation, absolute, relative and conditional positional encodings, vector attention, and local window attention with its efficient computation.

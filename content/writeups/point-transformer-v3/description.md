@@ -1,0 +1,1 @@
+A companion to Wu et al.'s Point Transformer V3 (2024): a point-cloud transformer that serialises points along space-filling curves, attends within large patches of the sequence, and replaces relative positional encoding with a sparse convolution, trading the precision of each mechanism for the speed to scale.

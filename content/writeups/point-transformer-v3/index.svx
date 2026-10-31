@@ -1,0 +1,163 @@
+---
+title: 'Point Transformer V3: Simpler, Faster, Stronger'
+created: 2026-10-31
+depends_on: [deep-learning-on-point-clouds, neighbour-search, concepts/attention-and-transformers]
+---
+
+<script>
+    import Serialization from './Serialization.svelte';
+</script>
+
+This writeup is a companion to the paper _Point Transformer V3: Simpler, Faster, Stronger_ by Xiaoyang Wu, Li Jiang, Peng-Shuai Wang, Zhijian Liu, Xihui Liu, Yu Qiao, Wanli Ouyang, Tong He and Hengshuang Zhao [](cite:wu2024), presented at CVPR in 2024. The paper describes a transformer backbone for point clouds, PTv3, that is faster and uses far less memory than its predecessors, while setting the state of the art on more than twenty benchmarks, indoor and outdoor, including LiDAR semantic segmentation on nuScenes, SemanticKITTI and Waymo and LiDAR object detection on Waymo. Its argument is unusual: it does not propose a better attention mechanism, but removes the costly mechanisms of earlier point transformers, accepting a small loss of precision in each, so that the network can be made large enough, and given a wide enough view, that the losses no longer matter. Its central device, ordering a point cloud along a space-filling curve and treating it as a sequence, has since been widely adopted.
+
+The paper relies on the following material, all explained elsewhere on the site:
+
+- [Attention and transformers](../../concepts/attention-and-transformers/), for dot-product attention, multi-head attention, the transformer block with [pre-norm](../../concepts/attention-and-transformers/#the-transformer-block), [positional encodings](../../concepts/attention-and-transformers/#positional-encoding), [vector attention](../../concepts/attention-and-transformers/#variants-of-the-attention-weights) and [window attention](../../concepts/attention-and-transformers/#local-attention);
+- [Deep learning on point clouds](../deep-learning-on-point-clouds/), for [sparse convolution](../deep-learning-on-point-clouds/#voxelnet-and-sparse-convolution), [semantic segmentation and detection benchmarks](../deep-learning-on-point-clouds/#tasks-and-benchmarks) and the [centre-based detection head](../deep-learning-on-point-clouds/#centre-based-heads) used in the paper's detection experiments;
+- [Spatial data structures and neighbour search](../neighbour-search/), for [k-nearest-neighbour queries](../neighbour-search/#neighbour-queries) and the [Morton codes](../neighbour-search/#octrees) of linear octrees.
+
+# The scaling principle
+
+The paper begins from an observation about where progress in deep learning has come from. In language and in 2D vision, gains have tracked scale: larger datasets, more parameters, wider receptive fields, more computation. In 3D, scale has been held back by small and fragmented datasets, and the authors cite a recent remedy, Point Prompt Training, which trains one model on several 3D datasets at once and lifted a sparse convolutional network on the ScanNet segmentation benchmark from $72.2\%$ to $77.0\%$ mIoU. That put the efficient convolutional backbone $1.6$ points ahead of the best point transformer trained from scratch, PTv2 [](cite:wu2022), and it was the convolutional network, not the transformer, that could exploit the larger data, because the transformer was too slow and memory-hungry to train at that scale.
+
+The authors draw a general conclusion, which they call the _scaling principle_: model performance is influenced more by scale than by intricate design. The accuracy–efficiency trade-off of backbone design, in which elaborate mechanisms buy accuracy at the cost of speed, is then not absolute. A mechanism that is slightly less accurate but much cheaper can be the better choice, if the savings allow the model to be scaled up, because after scaling the difference in the mechanism's precision becomes negligible.
+
+## Where the time went
+
+To find what to simplify, the authors profile PTv2. Point transformers before PTv3 had kept close to the idea that a point cloud is an unordered set. PTv1 [](cite:zhao2021) and PTv2 formed each point's neighbourhood by a k-nearest-neighbour query and computed [vector attention](../../concepts/attention-and-transformers/#variants-of-the-attention-weights) within it, with a relative positional encoding computed from the coordinate differences of each pair of points. In PTv2, the k-nearest-neighbour query took $28\%$ of the forward time and the relative positional encoding $26\%$, together more than half. The k-nearest-neighbour query is irregular, data-dependent work that GPUs do poorly, and the positional encoding, which on an image grid could be tabulated in advance because relative offsets come from a small fixed set, must on points be computed from pairwise distances through learned layers. These are the costs PTv3 removes.
+
+The paper's phrase for the change of view is "breaking the curse of permutation invariance": rather than treat the point cloud as an unordered set, it _serialises_ it into an ordered sequence, deliberately giving up the exact preservation of locality in exchange for the efficiency of structured data.
+
+# Point cloud serialisation
+
+## Space-filling curves
+
+A _space-filling curve_ is a path through every cell of a discrete grid that tends to keep cells close along the path when they are close in space. Mathematically it is a bijection $\varphi : \bbZ \to \bbZ^n$ from positions along the path to grid cells, here with $n = 3$. The paper uses two classic curves. The _Z-order_ (or Morton) curve visits cells in the order of their Morton codes, obtained by interleaving the bits of the cell's integer coordinates, the same codes used to store [linear octrees](../neighbour-search/#octrees); it is simple and fast to compute. The _Hilbert_ curve visits cells in a recursively folded order that never jumps between non-adjacent cells, and preserves locality better than Z-order, at somewhat greater cost to compute. Each curve traverses the axes in a fixed order, and changing the order, taking $y$ before $x$, gives a different curve with its seams in different places. The paper calls these variants _Trans Z-order_ and _Trans Hilbert_.
+
+## Serialised encoding
+
+Each point is given an integer code recording its position along the chosen curve. Its position $\bfp \in \bbR^3$ is quantised to a grid of size $g$ and passed through the inverse of the curve, $\varphi^{-1}(\lfloor \bfp / g \rfloor)$. To process a batch of point clouds together, each code is a 64-bit integer whose trailing $k$ bits hold the position along the curve and whose leading bits hold the index $b$ of the cloud within the batch:
+
+$$
+	\operatorname{Encode}(\bfp, b, g) = (b \ll k) \mid \varphi^{-1}\big(\lfloor \bfp / g \rfloor\big),
+$$
+
+where $\ll$ is a left shift and $\mid$ a bitwise or. _Serialisation_ is then simply sorting the points by their codes, which orders each cloud along the curve, clouds one after another, so that points adjacent in the sorted sequence are likely to be near in space. In the implementation the points are not physically reordered; the permutation produced by the sort is recorded, so that the network can switch cheaply between orders produced by different curves.
+
+<Serialization />
+
+# Serialised attention
+
+## Back to window and dot-product attention
+
+Image transformers use [window attention](../../concepts/attention-and-transformers/#local-attention) and dot-product attention, which suit the regular grid of pixels and are heavily optimised in practice. Earlier point transformers had abandoned both: without a grid, windows of points were hard to form, so they used k-nearest-neighbour neighbourhoods, and vector attention was found to converge better on points. Once a point cloud is serialised, it has a structure again, and the paper returns to window and dot-product attention, accepting that a window of consecutive points along a curve is a less exact neighbourhood than a k-nearest-neighbour query.
+
+## Patch attention
+
+The paper's form of window attention is _patch attention_: the serialised points are grouped into non-overlapping _patches_ of consecutive points, and attention is computed within each patch. Grouping is just slicing the sorted sequence, after padding it so that its length is a multiple of the patch size, which the paper does by borrowing points from neighbouring patches; reordering and padding together are a single indexing operation. Patches defined this way have exactly the same number of points, unlike neighbourhoods defined by a radius, which keeps the computation regular. The authors acknowledge that this sacrifices some precision in neighbourhoods compared with k-nearest neighbours, and argue that attention's ability to re-weight the points it is given, together with the much larger patches the efficiency allows, more than compensates.
+
+## Patch interaction
+
+With non-overlapping patches, information must also be able to cross from one patch to another, or the network could never relate points on either side of a patch boundary. The paper compares four schemes, the first two from earlier work.
+
+- **Shift Dilation** groups points at regular intervals along the sequence rather than consecutively, so each patch spans a wider region.
+- **Shift Patch** shifts the patch boundaries along the sequence between layers, like the shifted windows of image transformers.
+- **Shift Order** uses a different serialisation pattern in successive attention layers, so that points separated by a seam of one curve fall together under another.
+- **Shuffle Order**, the paper's proposal, randomly permutes the sequence of patterns assigned to the layers, so that each layer's receptive field is not tied to a single pattern.
+
+The default uses all four patterns (Z-order, Trans Z-order, Hilbert and Trans Hilbert) with Shift Order and Shuffle Order.
+
+## Positional encoding
+
+Window attention on points has relied on relative positional encodings for its accuracy, and these are exactly the expensive part. A cheaper alternative, a [conditional positional encoding](../../concepts/attention-and-transformers/#positional-encoding) (CPE), had been implemented for point transformers as an octree-based depthwise convolution. The authors observe that a relative positional encoding on points can itself be seen as a variant of a large-kernel sparse convolution, which makes the replacement natural. A single CPE fell short of the best accuracy, however, leaving about half a point to be gained by adding a relative encoding, so the paper introduces an enhanced version, xCPE: a [sparse convolution](../deep-learning-on-point-clouds/#voxelnet-and-sparse-convolution) layer with a skip connection placed directly before each attention layer. It costs a few milliseconds more than a plain CPE, and because it runs before attention rather than inside it, the attention itself remains standard dot-product attention and can use optimised implementations such as [FlashAttention](../../concepts/attention-and-transformers/#computing-attention-efficiently).
+
+# The network
+
+PTv3 is a U-Net [](cite:ronneberger2015): an encoder of four stages that progressively pools the points to coarser resolutions while widening their features, and a decoder of four stages that unpools them back to full resolution, each decoder stage receiving, through a skip connection, the features of the encoder stage at the same resolution, so that per-point predictions combine fine detail with wide context.
+
+- **Blocks.** Each block uses the [pre-norm](../../concepts/attention-and-transformers/#the-transformer-block) structure with layer normalisation: xCPE, then attention, then a feed-forward network, each with its residual connection. The encoder stages have $2$, $2$, $6$ and $2$ blocks; the decoder stages one each.
+- **Pooling.** Between stages, points are pooled by the grid pooling of PTv2, which merges the points falling in each cell of a coarser grid, each stage doubling the grid size. Here batch normalisation, not layer normalisation, turned out to be essential, which the authors attribute to its stabilising the distribution of point features during pooling. Shuffle Order is also applied at pooling.
+- **Sizes.** An embedding of two layers with $32$ channels; encoder channels of $64$, $128$, $256$ and $512$ with $4$, $8$, $16$ and $32$ attention heads; decoder channels of $64$, $64$, $128$ and $256$; patch size $1024$ at every stage; a feed-forward expansion ratio of $4$; stochastic depth (drop path) of $0.3$.
+
+# Ablations
+
+The design choices are tested on ScanNet semantic segmentation, reporting validation mIoU and latency on one RTX 4090.
+
+**Serialisation patterns and patch interaction.** With a single Z-order pattern and Shift Order alone (which cannot shift with one pattern), mIoU was $74.3$ at $54$ ms. Adding Shift Dilation or Shift Patch raised it to $75.5$ or $75.8$ but slowed the network to $89$ and $86$ ms, because both need attention masks. Using more patterns with Shift Order and Shuffle Order instead gained more at almost no cost: Z-order with Trans Z-order reached $76.9$ at $55$ ms, Hilbert with Trans Hilbert $76.8$ at $60$ ms, and all four patterns $77.3$ at $61$ ms.
+
+**Positional encoding.**
+
+| Encoding | Absolute | Relative | cRPE | CPE | xCPE |
+| --- | --- | --- | --- | --- | --- |
+| mIoU | 72.1 | 75.9 | 76.8 | 76.6 | 77.3 |
+| Latency | 50 ms | 72 ms | 101 ms | 58 ms | 61 ms |
+
+The relative encodings help a great deal over an absolute one but are slow; the convolutional encodings match or beat them at little cost, and xCPE is best.
+
+**Patch size.**
+
+| Patch size | 16 | 32 | 64 | 128 | 256 | 1024 | 4096 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| mIoU | 75.0 | 75.6 | 76.3 | 76.6 | 76.8 | 77.3 | 77.1 |
+
+Starting from the $16$ points of PTv2's neighbourhoods, accuracy rises steadily with the size of the patch, peaking at $1024$. This is the scaling principle at work: a receptive field sixty-four times wider is affordable only because each mechanism within it is cheap.
+
+**Normalisation and block structure.** Layer normalisation in the blocks with batch normalisation in pooling gave $77.3$, against $76.7$ with batch normalisation throughout, $76.1$ with layer normalisation throughout, and $75.6$ with the two swapped. Pre-norm gave $77.3$, against $72.3$ for post-norm and $76.6$ for the more elaborate block structure of earlier point transformers.
+
+# Efficiency
+
+On nuScenes, with a batch of one, the paper compares backbones as their receptive field is widened: the kernel size of a sparse convolutional network (MinkUNet), the neighbourhood size of PTv2 and the patch size of PTv3.
+
+| Backbone | Parameters | Training latency | Training memory | Inference latency | Inference memory |
+| --- | --- | --- | --- | --- | --- |
+| MinkUNet, kernel 3 | 37.9 M | 163 ms | 3.3 G | 48 ms | 1.7 G |
+| MinkUNet, kernel 7 | 465.0 M | 1120 ms | 12.4 G | 337 ms | 2.8 G |
+| PTv2, 16 neighbours | 12.8 M | 213 ms | 10.3 G | 146 ms | 12.3 G |
+| PTv2, 32 neighbours | 12.8 M | 354 ms | 21.5 G | 213 ms | 19.4 G |
+| PTv3, patch 256 | 46.2 M | 120 ms | 3.3 G | 44 ms | 1.2 G |
+| PTv3, patch 1024 | 46.2 M | 119 ms | 3.3 G | 44 ms | 1.2 G |
+| PTv3, patch 4096 | 46.2 M | 125 ms | 3.3 G | 45 ms | 1.2 G |
+
+Widening a convolution's kernel multiplies its parameters and time; widening PTv2's neighbourhood multiplies its memory; widening PTv3's patch from $256$ to $4096$ points costs almost nothing. Against PTv2 with its usual $16$ neighbours, PTv3 runs inference $3.3$ times faster with $10.2$ times less memory, and it is faster even than the smallest convolutional network. On ScanNet the picture is similar: $61$ ms and $5.2$ GB at inference, against $191$ ms and $18.2$ GB for PTv2.
+
+# Results on LiDAR data
+
+Results are reported both for models trained from scratch on each dataset and for models trained jointly on several datasets with Point Prompt Training (PPT), the second given in parentheses.
+
+**Outdoor semantic segmentation.** For per-point labelling of LiDAR scans, scored by mIoU:
+
+| Method | nuScenes val | nuScenes test | SemanticKITTI val | SemanticKITTI test | Waymo val |
+| --- | --- | --- | --- | --- | --- |
+| MinkUNet | 73.3 | — | 63.8 | — | 65.9 |
+| SphereFormer | 78.4 | 81.9 | 67.8 | 74.8 | 69.9 |
+| PTv2 | 80.2 | 82.6 | 70.3 | 72.6 | 70.6 |
+| PTv3 | 80.4 (81.2) | 82.7 (83.0) | 70.8 (72.3) | 74.2 (75.5) | 71.3 (72.1) |
+
+On validation, PTv3 exceeded SphereFormer, the previous state of the art, by $2.0$ points on nuScenes and $3.0$ on SemanticKITTI, margins that grew to $2.8$ and $4.5$ with multi-dataset training. The authors note that PTv3 works without clipping the scan to a fixed range, a step most outdoor models depend on.
+
+**Outdoor object detection.** To detect objects in Waymo scans, PTv3 is used as the backbone of a [CenterPoint](../deep-learning-on-point-clouds/#centre-based-heads) detector, following the settings of FlatFormer, a serialisation-based transformer for detection, and compared with other single-stage detectors at LEVEL 2:
+
+| Backbone | Frames | Vehicle APH | Pedestrian APH | Cyclist APH | Mean APH |
+| --- | --- | --- | --- | --- | --- |
+| PointPillars | 1 | 63.1 | 50.3 | 59.9 | 57.8 |
+| CenterPoint | 1 | 66.2 | 62.6 | 67.6 | 65.5 |
+| FlatFormer | 1 | 68.6 | 65.3 | 67.5 | 67.2 |
+| PTv3 | 1 | 70.8 | 70.4 | 70.4 | 70.5 |
+| FlatFormer | 3 | 71.0 | 71.3 | 73.7 | 72.0 |
+| PTv3 | 3 | 72.5 | 75.0 | 71.4 | 73.0 |
+
+With a single frame PTv3 leads FlatFormer by $3.3$ points of mean APH, and with multiple frames by about one point, its largest gains being on pedestrians, though with multiple frames it trails FlatFormer on cyclists.
+
+**Indoor results.** On indoor benchmarks PTv3 likewise set new records: on ScanNet semantic segmentation $77.5$ validation and $77.9$ test mIoU from scratch ($78.6$ and $79.4$ with joint training), $3.7$ points above PTv2 on the test split; on S3DIS $77.7$ mIoU in six-fold cross-validation ($80.8$), $4.2$ points above PTv2; and gains in instance segmentation and in data-efficient settings with few labelled scenes or points.
+
+**Training.** For outdoor segmentation, models are trained with AdamW and a cosine schedule on the sum of a cross-entropy and a Lovász loss, at a learning rate of $0.002$ (scaled by a tenth for the network's blocks), weight decay $0.005$ and batches of $12$, for $50$ epochs. Augmentations are random rotation about the vertical axis, scaling by a factor in $[0.9, 1.1]$, random flips, small jitter, and grid sampling at $0.05$ m. Detection follows the CenterPoint framework, trained with Adam for $24$ epochs on Waymo.
+
+# Limitations
+
+The authors name three. First, returning to dot-product attention for efficiency slows convergence and limits how deep the network can be scaled compared with vector attention, a problem they connect to the "attention sinks" observed in other transformers, in which the softmax concentrates weight on a few tokens; better attention mechanisms remain to be found. Second, the paper does not itself scale the parameters up, and the authors suggest that current point transformers already have more capacity than existing tasks need, so that scaling models must go together with scaling data and tasks. Third, they propose that serialisation, which turns any $n$-dimensional data into a one-dimensional sequence while largely preserving proximity, could let one model encode images and point clouds together.
+
+# Assessment
+
+PTv3's contribution is less a new mechanism than a demonstration of a design method: measure where a model spends its time, replace each costly mechanism with a cheap approximation (a sort along a space-filling curve for a k-nearest-neighbour query, a sparse convolution for a relative positional encoding, standard dot-product attention for vector attention), and spend the savings on scale, here a receptive field sixty-four times wider. The ablations support the method within the paper: each approximation loses little, and widening the patch gains much.
+
+For LiDAR, the paper matters in two ways. As a backbone, it gave the best results of its time on the three main LiDAR segmentation benchmarks and improved a CenterPoint detector on Waymo, while running faster than a sparse convolutional network, the previous default for efficiency. And as an idea, serialisation reduces point clouds to sequences, the form of data on which the largest models and the most optimised software of deep learning operate, which is why it has spread to later point-cloud backbones and multimodal models. Its weaknesses are those of its approximations: a curve's seams separate some near points, which the shuffling of patterns mitigates but does not remove, and the quality of a patch as a neighbourhood depends on the grid size and the density of the points, which on a LiDAR scan vary strongly with range.
