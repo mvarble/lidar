@@ -1,0 +1,162 @@
+---
+title: 'LOAM: Lidar Odometry and Mapping in Real-time'
+created: 2026-10-31
+depends_on: [lidar-odometry-and-slam, scan-registration]
+---
+
+<script>
+    import Features from './Features.svelte';
+</script>
+
+This writeup is a companion to the paper _LOAM: Lidar Odometry and Mapping in Real-time_ by Ji Zhang and Sanjiv Singh [](cite:zhang2014), presented at Robotics: Science and Systems in 2014. The paper estimates the motion of a moving LiDAR and builds a map from its scans, in real time and with no other sensor, and it does so with an idea that has shaped LiDAR odometry ever since: split the problem into a fast, rough odometry and a slow, careful mapping, and let both register only a few hundred well-chosen _feature points_ lying on sharp edges and on flat surfaces. Nearly every LiDAR odometry system of the following decade, from LeGO-LOAM to the LiDAR–inertial systems in use today, is a descendant of it or defines itself against it.
+
+The paper relies on several ideas explained in the crash course, and this writeup links to them rather than repeating them:
+
+- [LiDAR odometry and SLAM](../lidar-odometry-and-slam/), for odometry, drift, scan-to-map registration and the [summary of LOAM](../lidar-odometry-and-slam/#loam-and-feature-based-odometry) of which this writeup is the detailed account;
+- [Scan registration](../scan-registration/), for ICP, [point-to-plane residuals](../scan-registration/#point-to-plane-icp) and [robust weighting](../scan-registration/#icp-in-practice);
+- [Coordinate frames, rigid transforms and calibration](../frames-and-transforms/), for [Rodrigues' formula](../frames-and-transforms/#axis-and-angle) and [deskewing](../frames-and-transforms/#motion-distortion-and-deskewing);
+- [Filtering, normals and local features](../normals-and-local-features/), for the [eigenvalues of a neighbourhood's covariance](../normals-and-local-features/#shape-from-eigenvalues);
+- [Spatial data structures and neighbour search](../neighbour-search/), for [k-d trees](../neighbour-search/#k-d-trees) and [voxel downsampling](../neighbour-search/#voxel-downsampling).
+
+# The problem
+
+The paper considers a LiDAR moving freely in six degrees of freedom, carried by a person or a vehicle, with no GPS, no wheel odometry and, in its main form, no IMU. The difficulty it emphasises is the one described in the crash course as [motion distortion](../how-lidar-works/#time-and-motion): the points of a scan are measured at different times, while the sensor moves, so estimating the motion requires the undistorted scan, and undistorting the scan requires the motion. Earlier systems either used another sensor to supply the motion, or solved for the whole trajectory in a batch afterwards, often with loop closure to remove drift, which made them unsuitable for a vehicle that needs its position now. LOAM aims for low drift and low computation together, and it deliberately leaves out loop closure, so that what it delivers is odometry and a map built from it.
+
+The sensor used throughout the paper is not one of the multi-beam spinning sensors that dominate the crash course but a custom one: a Hokuyo UTM-30LX, a single-beam scanner that sweeps a plane over a $180°$ field of view at $0.25°$ resolution, forty lines a second, mounted on a motor that rocks the scanning plane back and forth between $-90°$ and $90°$ at $180°$ per second. A _sweep_, one complete coverage of the scene, is one such rotation and lasts a second. The points are therefore organised in _scans_, the individual lines of the Hokuyo, with $0.25°$ between neighbouring points within a scan but $180° / 40 = 4.5°$ between successive scans. This asymmetry, dense along each scan line and sparse across them, is the same as that of a spinning multi-beam sensor, where each scan line is a [ring](../how-lidar-works/#the-ring-index), and it is what the method is built around. The paper also evaluates LOAM on the Velodyne data of the KITTI benchmark, for which a sweep is one revolution of the sensor.
+
+## Notation
+
+The paper writes $P_k$ for the point cloud perceived during sweep $k$, and uses two frames: the LiDAR frame $\{L\}$, with origin at the sensor's centre, and the world frame $\{W\}$, which coincides with $\{L\}$ at the starting position. Its axes follow a camera-like convention, $x$ to the left, $y$ up and $z$ forward, unlike the $x$-forward convention of the crash course; nothing in the method depends on the choice. The paper assumes the sensor is calibrated and that its linear and angular velocities are smooth and continuous over time, without abrupt changes. That second assumption is relaxed later with an IMU. Below, $\bfx_i$ denotes a point of the newest sweep, $\tilde\bfx_i$ the same point re-projected to the start of its sweep, and $\bar\bfx_j$ a point of the previous sweep re-projected to that sweep's end; the paper writes these as $X^L_{(k+1,i)}$, $\tilde X^L_{(k+1,i)}$ and $\bar X^L_{(k,j)}$.
+
+# Two algorithms at two rates
+
+The heart of the paper is a decomposition. Instead of optimising every pose and the map jointly, as full SLAM does, it runs two algorithms in parallel.
+
+- **Lidar odometry** runs at about $10$ Hz. It registers the newest, still-growing sweep against the previous sweep, using few feature points and fast correspondence search, to estimate the sensor's velocity, and it uses that estimate to remove the motion distortion from each completed sweep.
+- **Lidar mapping** runs at about $1$ Hz, once per sweep. It takes each undistorted sweep and registers it against the accumulated map, using ten times as many feature points and a more careful correspondence search, so it is slower and more accurate.
+
+The output pose combines the two: the latest mapping pose of the end of the previous sweep, $T^W_k$, composed with the odometry's motion since, $T^L_{k+1}$, published at the odometry's rate. Because odometry already supplies a good motion estimate, the mapping step is given a whole second, enough time to use many points and many iterations, while the system as a whole still answers ten times a second. This division between a fast front end that tracks motion and a slow back end that refines it against the map is now standard.
+
+# Feature points
+
+Both algorithms register _feature points_ rather than all points: points on sharp edges, which will be matched to edge lines, and points on planar surfaces, which will be matched to planar patches. Because the scan lines of the sensor are dense and the gaps between them wide, features are found within each scan line separately.
+
+## The smoothness of a scan line
+
+For a point $\bfx_i$ in a scan, let $S$ be a set of consecutive points from the same scan on either side of it, half on each side. The paper defines the _smoothness_ of the local surface as
+
+$$
+	c = \frac{1}{|S| \cdot \lVert \bfx_i \rVert} \Big\lVert \sum_{j \in S,\ j \neq i} (\bfx_i - \bfx_j) \Big\rVert. @tag(smoothness)
+$$
+
+On a flat stretch of surface, the differences to the neighbours on one side cancel those to the neighbours on the other, so the sum is near zero. At a corner or an edge they do not cancel, and the sum is large. The division by $\lVert\bfx_i\rVert$ makes the measure comparable across ranges, since the spacing between neighbouring points, and so the size of every difference, grows in proportion to range. The points of each scan are sorted by $c$, and those with the largest values become _edge points_ and those with the smallest _planar points_.
+
+## Spreading and screening the features
+
+Two further rules decide which candidates are kept. To spread the features over the scene, each scan is divided into four equal subregions, and each subregion contributes at most two edge points and four planar points, and only points whose $c$ is beyond a threshold. And a point is not selected if a point among its neighbours $S$ has already been selected, which keeps features from clustering.
+
+The paper also excludes two kinds of point it considers unreliable. The first lies on a surface nearly parallel to the laser beam, where the points are stretched far apart along the surface and their positions are poorly determined. The second lies on the boundary of an occluded region: a point on a background surface just beyond the silhouette of a nearer object looks like an edge, because the scan line jumps there, but the apparent edge is created by the viewpoint and moves as the sensor moves, so it would be matched to the wrong place in the next sweep. The test is that a point is rejected if a point among its neighbours lies across a gap in the direction of the beam and is nearer to the sensor than it is.
+
+<Features />
+
+For a sensor with many rings, the same computation is simply run on every ring, which is how the method was applied to KITTI's Velodyne data and how its open-source descendants work.
+
+# Lidar odometry
+
+## Matching sweep to sweep
+
+The odometry algorithm works on two clouds. At the end of sweep $k$, its points are re-projected to the time $t_{k+1}$ at which the sweep ended, using the motion estimated over it, giving the undistorted cloud $\bar P_k$, which is stored in a [k-d tree](../neighbour-search/#k-d-trees). During sweep $k + 1$, the new cloud $P_{k+1}$ grows as points arrive, and the odometry repeatedly estimates the motion so far. In each iteration, the edge points $E_{k+1}$ and planar points $H_{k+1}$ extracted from $P_{k+1}$ are re-projected to the start of the sweep with the current motion estimate, giving $\tilde E_{k+1}$ and $\tilde H_{k+1}$, and each is matched to the previous sweep.
+
+An **edge point** $\tilde\bfx_i$ is matched to an edge line through two points of $\bar P_k$. The first, $\bar\bfx_j$, is its nearest neighbour; the second, $\bar\bfx_l$, is its nearest neighbour in the two scans adjacent to the scan containing $j$. The two must come from different scans, since a single scan line crosses an edge only once, and both are checked to be edge points by their smoothness [](eq:smoothness). The residual is the distance from the point to the line through them,
+
+$$
+	d_{\mathcal{E}} = \frac{\big\lVert (\tilde\bfx_i - \bar\bfx_j) \times (\tilde\bfx_i - \bar\bfx_l) \big\rVert}{\lVert \bar\bfx_j - \bar\bfx_l \rVert}, @tag(point-to-line)
+$$
+
+the area of the parallelogram spanned by the vectors to the two points, divided by its base.
+
+A **planar point** is matched to a planar patch through three points of $\bar P_k$: its nearest neighbour $\bar\bfx_j$, its nearest neighbour $\bar\bfx_l$ in the same scan as $j$, and its nearest neighbour $\bar\bfx_m$ in the two adjacent scans, a choice that guarantees the three are not collinear. They are checked to be planar points by their smoothness, and the residual is the distance to the plane through them,
+
+$$
+	d_{\mathcal{H}} = \frac{\Big| (\tilde\bfx_i - \bar\bfx_j) \cdot \big( (\bar\bfx_j - \bar\bfx_l) \times (\bar\bfx_j - \bar\bfx_m) \big) \Big|}{\big\lVert (\bar\bfx_j - \bar\bfx_l) \times (\bar\bfx_j - \bar\bfx_m) \big\rVert}, @tag(point-to-plane)
+$$
+
+the component of the offset from $\bar\bfx_j$ along the plane's normal. This is the residual of [point-to-plane ICP](../scan-registration/#point-to-plane-icp), with the normal computed from three points rather than a fitted neighbourhood.
+
+## Motion within a sweep
+
+To relate the points of the sweep, which were measured at different times, to one transform, the paper models the motion during a sweep as constant in linear and angular velocity. Let $T_{k+1} = (t_x, t_y, t_z, \theta_x, \theta_y, \theta_z)\T$ be the sensor's motion from the start of the sweep, $t_{k+1}$, to the current time $t$: a translation and a rotation vector. A point $i$ measured at time $t_i$ is then assigned the motion
+
+$$
+	T_{(k+1,i)} = \frac{t_i - t_{k+1}}{t - t_{k+1}}\, T_{k+1}, @tag(interpolation)
+$$
+
+a linear interpolation of the six numbers, which for small motions is the constant-velocity [deskewing](../frames-and-transforms/#motion-distortion-and-deskewing) of the crash course. The point and its re-projection to the start of the sweep are related by
+
+$$
+	\bfx_i = R\,\tilde\bfx_i + T_{(k+1,i)}(1{:}3),
+$$
+
+where $T_{(k+1,i)}(1{:}3)$ is the translational part and $R$ is the rotation by the angle $\theta = \lVert T_{(k+1,i)}(4{:}6) \rVert$ about the unit axis $\bfomega = T_{(k+1,i)}(4{:}6) / \theta$, given by [Rodrigues' formula](../frames-and-transforms/#axis-and-angle).
+
+## Solving for the motion
+
+Each edge point now gives a residual $d_{\mathcal{E}}$, and each planar point a residual $d_{\mathcal{H}}$, as a function of the single unknown $T_{k+1}$. Stacking them gives a nonlinear system $\mathbf{f}(T_{k+1}) = \mathbf{d}$, one row per feature point, which is driven towards zero by the Levenberg–Marquardt method: with $J$ the Jacobian of $\mathbf{f}$ with respect to $T_{k+1}$,
+
+$$
+	T_{k+1} \leftarrow T_{k+1} - \big(J\T J + \lambda \operatorname{diag}(J\T J)\big)^{-1} J\T \mathbf{d}, @tag(levenberg-marquardt)
+$$
+
+where $\lambda$ is adjusted from iteration to iteration: small, the step is the Gauss–Newton step of the crash course's [point-to-plane ICP](../scan-registration/#point-to-plane-icp); large, it shrinks towards a short gradient-descent step, which is safer when the linearisation is poor.
+
+The fit is made robust by weighting. In each iteration, every row is given a _bisquare_ weight according to its residual, so that features far from their correspondences count for less, and those beyond a threshold count for nothing and are treated as outliers. The paper cites the method without giving its constant; the bisquare (or Tukey) weight of a residual $r$ with cut-off $\kappa$ is
+
+$$
+	w(r) = \begin{cases} \big(1 - (r / \kappa)^2\big)^2, & |r| < \kappa, \\ 0, & |r| \ge \kappa, \end{cases}
+$$
+
+an instance of the [robust kernels](../scan-registration/#icp-in-practice) used in iteratively reweighted least squares.
+
+The whole odometry is the paper's Algorithm 1. At the start of a sweep, the motion estimate is reset to zero. Then, each time it runs, the algorithm extracts features from the points of the sweep received so far, and iterates: re-project the features to the sweep's start, find correspondences in $\bar P_k$, compute residuals and bisquare weights, and take a Levenberg–Marquardt step, until convergence or an iteration limit. At the end of the sweep, every point of $P_{k+1}$ is re-projected to the sweep's end time with the final estimate, forming the undistorted $\bar P_{k+1}$ that the next sweep is matched against and that is passed to the mapping.
+
+# Lidar mapping
+
+Once per sweep, the mapping algorithm receives the undistorted cloud $\bar P_{k+1}$ and the odometry's motion over the sweep, $T^L_{k+1}$. It holds the map $Q_k$, all the points accumulated up to sweep $k$, and the pose $T^W_k$ of the sensor on the map at the end of sweep $k$. It extends that pose by the odometry's motion to predict $T^W_{k+1}$, projects $\bar P_{k+1}$ into the world frame as $\bar Q_{k+1}$, and then refines $T^W_{k+1}$ by registering $\bar Q_{k+1}$ against $Q_k$. This is scan-to-map registration, the choice the crash course singles out as the [most important in an odometry pipeline](../lidar-odometry-and-slam/#a-lidar-odometry-pipeline).
+
+Feature points are extracted as before, but ten times as many are used. The map is stored in cubes $10$ m on a side, and only the points in cubes that intersect the new sweep are loaded into a k-d tree, which bounds the cost of the search however large the map grows.
+
+Correspondences are found differently from the odometry. For each feature point, the set $S'$ of map points around it is collected, keeping only edge points for an edge feature and planar points for a planar feature, and their covariance matrix $M$ is decomposed into eigenvalues and eigenvectors. If $S'$ lies along an edge line, one eigenvalue is much larger than the other two, and its eigenvector gives the line's direction; if $S'$ lies on a planar patch, two eigenvalues are large and one much smaller, and the eigenvector of the smallest gives the patch's normal. This is exactly the analysis of [shape from eigenvalues](../normals-and-local-features/#shape-from-eigenvalues) in the crash course. The line or plane is placed through the centroid of $S'$, and two points on the line, or three on the plane, are chosen so that the residuals [](eq:point-to-line) and [](eq:point-to-plane) can be reused unchanged. Since the sweep is already undistorted, all its points share one pose, and the residuals are minimised by the same bisquare-weighted Levenberg–Marquardt iteration. The registered sweep is added to the map, which is kept evenly dense by a [voxel-grid filter](../neighbour-search/#voxel-downsampling) with $5$ cm voxels.
+
+Compared with the odometry's matching, which builds lines and planes from two or three raw neighbours, fitting them to a whole neighbourhood of map points is slower but much less sensitive to noise, which is the trade the two-rate design is meant to make.
+
+# Experiments
+
+The two algorithms ran on two cores of a laptop with a $2.5$ GHz quad-core processor, under ROS, and the code and data were released publicly.
+
+**Indoor and outdoor tests.** The sensor was pushed on a cart through a long corridor and a large lobby, and mounted on a ground vehicle on a vegetated road and in an orchard, always at $0.5$ m/s. To measure local accuracy, the authors collected a second set of scans from the same places with the sensor stationary, registered them to the maps with point-to-plane ICP, and examined the distances: matching errors were smaller indoors than outdoors, which the authors attribute to features in natural scenes being less exact than in built ones. To measure drift, they used a corridor containing a closed loop, so that the gap between the start and the end of the estimated trajectory measured the accumulated drift, and the orchard with a high-accuracy GPS/INS for ground truth. The relative errors were as follows.
+
+| Environment | Test 1 distance | Test 1 drift | Test 2 distance | Test 2 drift |
+| --- | --- | --- | --- | --- |
+| Corridor | 58 m | 0.9% | 46 m | 1.1% |
+| Orchard | 52 m | 2.3% | 67 m | 2.8% |
+
+That is, about $1\%$ of the distance travelled indoors and about $2.5\%$ outdoors.
+
+**Assistance from an IMU.** To cope with fast changes of velocity, which violate the assumption of smooth motion, an Xsens MTi-10 IMU was attached and used to pre-process each sweep before the method ran: its orientation, from a Kalman filter on the gyroscope and accelerometer, rotates each point to the orientation at the start of its sweep, and its acceleration removes the part of the distortion that is not constant-velocity, leaving the method to handle the rest. With the sensor carried by hand and moved up and down by about half a metre while walking, the errors relative to tape-measured ground truth were these.
+
+| Environment | Distance | IMU orientation only | LOAM | LOAM with IMU |
+| --- | --- | --- | --- | --- |
+| Corridor | 32 m | 16.7% | 2.1% | 0.9% |
+| Lobby | 27 m | 11.7% | 1.7% | 1.3% |
+| Vegetated road | 43 m | 13.7% | 4.4% | 2.6% |
+| Orchard | 51 m | 11.4% | 3.7% | 2.1% |
+
+The authors' reading is that the IMU cancels the nonlinear part of the motion and the method handles the linear part, a division of labour that tightly coupled LiDAR–inertial systems later [took much further](../lidar-odometry-and-slam/#fusing-an-imu).
+
+**KITTI.** On the KITTI odometry benchmark, recorded with a Velodyne sensor at $10$ Hz over $39.2$ km of urban, country and motorway driving, LOAM, using the LiDAR alone, was ranked first among all methods evaluated on the benchmark irrespective of sensing modality, including stereo visual odometry, with an average position error of $0.88\%$ of the distance travelled, computed over segments from $100$ to $800$ m long, the benchmark's [relative error metric](../lidar-odometry-and-slam/#evaluation).
+
+# Assessment
+
+The paper's lasting contributions are three. The first is the decomposition into fast odometry and slow mapping, which made accurate LiDAR odometry real-time on the hardware of its day. The second is the use of a small number of edge and planar features, selected along scan lines by the smoothness [](eq:smoothness) and screened for reliability, with point-to-line and point-to-plane residuals. The third is the treatment of motion distortion as part of the estimation, through the interpolation [](eq:interpolation), rather than as a separate preprocessing step.
+
+Its limitations are mostly ones the paper states. It has no loop closure, so its drift, small as it is, is never corrected, and the authors name loop closure and fusion with an IMU in a Kalman filter as future work, which later systems supplied through [pose graphs](../lidar-odometry-and-slam/#pose-graphs) and tightly coupled filters. Its motion model assumes smooth velocity within a sweep, which the IMU experiments show breaking down under hand-held motion. And its feature extraction is a set of hand-tuned rules (thresholds, subregion counts, the reliability tests) whose behaviour depends on the sensor and the scene. Where geometric features are scarce, as in a long featureless tunnel or on an open road, the residuals constrain some directions of motion poorly, the [degeneracy](../scan-registration/#degeneracy) problem, which the paper does not address. Later work showed that with careful deskewing and robust estimation, dense registration of downsampled points can match feature-based registration without the hand-tuned rules [](cite:vizzo2023), but the structure LOAM introduced, of features or points registered scan-to-map with distortion handled in the estimation, remains the template for the field.

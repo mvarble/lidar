@@ -1,0 +1,1 @@
+A companion to Zhang and Singh's LOAM (2014): real-time LiDAR odometry and mapping by splitting the problem into fast sweep-to-sweep odometry and slow scan-to-map mapping, both registering edge and planar feature points chosen by a smoothness measure along each scan line.
