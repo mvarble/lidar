@@ -1,0 +1,196 @@
+---
+title: 'PointNet: Deep Learning on Point Sets for 3D Classification and Segmentation'
+created: 2026-10-31
+depends_on: [deep-learning-on-point-clouds]
+---
+
+<script>
+    import Statement from '@mvarble/mesearch/Statement.svelte';
+    import Proof from '@mvarble/mesearch/Proof.svelte';
+    import * as universalApproximation from './statements/universal-approximation.md';
+    import * as criticalPointSet from './statements/critical-point-set.md';
+    import CriticalPoints from './CriticalPoints.svelte';
+</script>
+
+This writeup is a companion to the paper _PointNet: Deep Learning on Point Sets for 3D Classification and Segmentation_ by Charles R. Qi, Hao Su, Kaichun Mo and Leonidas J. Guibas [](cite:qi2017), presented at CVPR in 2017. The paper introduced the first deep network to consume raw point clouds directly, without first converting them to voxels or to rendered images, and it did so with an architecture so simple that it fits in one equation: apply the same small network to every point, then take an elementwise maximum over the points. That design, and the paper's analysis of why it works, underlies a large part of the deep learning on point clouds that followed, including the pillar and voxel encoders of the LiDAR object detectors in use today.
+
+The paper relies on the following material from the crash course:
+
+- [Deep learning on point clouds](../deep-learning-on-point-clouds/), which explains why point clouds are [awkward for networks](../deep-learning-on-point-clouds/#why-point-clouds-are-awkward-for-networks), gives a [short summary of PointNet](../deep-learning-on-point-clouds/#pointnet) of which this writeup is the full account, and describes the [encoders built on it](../deep-learning-on-point-clouds/#networks-on-voxels-and-pillars);
+- [Filtering, normals and local features](../normals-and-local-features/), for the hand-crafted point features, such as [FPFH](../normals-and-local-features/#fast-point-feature-histograms), that PointNet's learned features replace;
+- [Clustering and bounding boxes](../clustering-and-bounding-boxes/), for the connected-component clustering the paper uses in its detection experiment.
+
+It also assumes familiarity with multilayer perceptrons, batch normalisation, dropout and training by stochastic gradient descent.
+
+# The problem
+
+Before PointNet, networks for 3D data imposed a regular structure on it: they voxelised shapes into occupancy grids and applied 3D convolutions, or rendered them from many viewpoints and applied 2D convolutions to the images. The authors object that these conversions make the data "unnecessarily voluminous" and introduce quantisation artefacts that obscure its natural invariances, and they propose instead to consume the points themselves.
+
+The input is a set of $n$ points $\{P_i \mid i = 1, \dots, n\}$, each a vector of its coordinates $(x, y, z)$, possibly with extra channels such as colour or normal; most of the paper uses the coordinates alone. Two kinds of output are wanted from one architecture: for _classification_, $k$ scores for the $k$ candidate classes of the whole input; for _segmentation_, $n \times m$ scores, one for each point and each of $m$ semantic categories, which may be the parts of an object or the classes of objects in a scene.
+
+# Properties of point sets
+
+The design follows from three properties the authors identify (their Section 4.1).
+
+- **Unordered.** A point cloud is a set, so a network that consumes $N$ points must give the same answer for all $N!$ orders in which they might be listed.
+- **Interaction among points.** The points lie in a metric space, so neighbouring points form meaningful subsets, and the network should be able to capture local structure and the interactions between local structures.
+- **Invariance under transformations.** Rotating and translating all the points together should not change the category of the object or the segmentation of its points.
+
+# A symmetric function for unordered input
+
+The paper considers three ways to make a network invariant to the order of its input. The first is to _sort_ the input into a canonical order. The authors argue that this cannot work in general: an ordering that is stable under small perturbations of the points would be a map from a high-dimensional space to the real line that preserves proximity, which cannot exist, so the network would still see inputs whose order changes abruptly under small changes. The second is to treat the points as a sequence and train a recurrent network on many random permutations, hoping it learns to ignore the order. Earlier work had shown that order matters to such networks, and they scale poorly to the thousands of elements a point cloud holds. The third, adopted by the paper, is to combine the points with a _symmetric function_, one whose value does not depend on the order of its arguments, as addition and multiplication do not.
+
+Specifically, a function on point sets is approximated by applying a function $h$ to each point separately and combining the results with a symmetric function $g$:
+
+$$
+	f(\{\bfx_1, \dots, \bfx_n\}) \approx g\big(h(\bfx_1), \dots, h(\bfx_n)\big), @tag(decomposition)
+$$
+
+where $h : \bbR^N \to \bbR^K$ and $g : \bbR^K \times \cdots \times \bbR^K \to \bbR$ is symmetric. In PointNet, $h$ is a multilayer perceptron and $g$ is an elementwise maximum over the points followed by a further function $\gamma$, so that $g = \gamma \circ \operatorname{MAX}$. Each of the $K$ coordinates of $h$ is a learned function of position, and the maximum keeps, for each, the largest value attained anywhere in the set. A collection of such $h$ thus learns a collection of $f$'s, each capturing a different property of the set.
+
+The perceptron $h$ is _shared_: the same weights are applied to every point, independently. Applied to an $n \times 3$ array of points, a shared layer is a matrix product of the array with a weight matrix, followed by a bias and a nonlinearity on each row, which is why such layers are usually implemented as convolutions with a kernel of size one over the list of points.
+
+# The architecture
+
+## Classification network
+
+The classification network is shown in the paper's Figure 2. Every layer except the last uses batch normalisation and a ReLU.
+
+1. The $n \times 3$ input passes through an **input transform**: a small network predicts a $3 \times 3$ matrix, which multiplies the points.
+2. A shared perceptron with layers of $64$ and $64$ units lifts each point to $64$ dimensions.
+3. A **feature transform** predicts a $64 \times 64$ matrix, which multiplies the features.
+4. A shared perceptron with layers of $64$, $128$ and $1024$ units lifts each point to $1024$ dimensions.
+5. **Max pooling** over the $n$ points gives the $1024$-dimensional _global feature_.
+6. A perceptron with layers of $512$, $256$ and $k$ units maps the global feature to the class scores, with dropout (keeping $70\%$ of units) on the $256$-unit layer.
+
+## Joint alignment networks
+
+The two transforms are the paper's answer to the third property. Rather than hoping the network learns invariance to rigid motions, it learns to undo them: a small network, the _T-Net_, predicts a transformation matrix from the input and applies it directly to the coordinates. The idea follows the spatial transformer networks of image recognition, which must resample images; for points the transformation is just a matrix product, and no new kind of layer is needed. The T-Net is itself a small PointNet: a shared perceptron of $64$, $128$ and $1024$ units, max pooling, and fully connected layers of $512$ and $256$ units, regressing the matrix, whose output is initialised to the identity.
+
+The feature transform is a $64 \times 64$ matrix, far harder to optimise than the $3 \times 3$ one, so the training loss adds a regulariser that pushes it towards an orthogonal matrix:
+
+$$
+	L_{\mathrm{reg}} = \lVert I - A A\T \rVert_F^2, @tag(regulariser)
+$$
+
+where $A$ is the predicted feature transform and $\lVert\cdot\rVert_F$ the Frobenius norm. An orthogonal transformation loses no information from its input, which is the property wanted, and the authors report that the regulariser makes optimisation more stable and the results better. It is added to the classification loss with weight $0.001$.
+
+## Segmentation network
+
+Segmentation needs both local and global information: whether a point lies on a chair leg depends on its own position and on the shape of the whole chair. The segmentation network obtains both by concatenating the global feature onto the per-point features. The $64$-dimensional features after the feature transform are concatenated, for each point, with the $1024$-dimensional global feature, giving $n \times 1088$; a shared perceptron of $512$, $256$ and $128$ units and then one of $128$ and $m$ units produce the per-point scores. Each point's prediction then depends on its own feature and on a summary of the whole set. As a check that this gives local awareness, the authors train the segmentation network to regress each point's surface normal, a property of its neighbourhood, and report reasonable reconstructions.
+
+For part segmentation, the paper modifies this network: it concatenates a one-hot vector of the object's category to the global feature, widens some layers, and adds skip connections from several intermediate layers to the per-point features.
+
+## Training
+
+Training uses Adam with an initial learning rate of $0.001$, momentum $0.9$ and batches of $32$, halving the learning rate every $20$ epochs. The batch-normalisation decay rate starts at $0.5$ and rises gradually to $0.99$. The segmentation network uses no dropout.
+
+# Theoretical analysis
+
+The paper gives two theorems about the decomposition [](eq:decomposition) with $g = \gamma \circ \operatorname{MAX}$. They need a notion of distance between point sets.
+
+## The Hausdorff distance
+
+The _Hausdorff distance_ between two sets $S$ and $S'$ measures how far either set strays from the other:
+
+$$
+	d_H(S, S') = \max\Big\{ \max_{\bfs \in S} \min_{\bfs' \in S'} \lVert \bfs - \bfs' \rVert,\ \max_{\bfs' \in S'} \min_{\bfs \in S} \lVert \bfs - \bfs' \rVert \Big\}.
+$$
+
+It is small exactly when every point of each set is near some point of the other, regardless of how the points correspond or how many there are. Two scans of the same surface, sampled at different points, are close in Hausdorff distance, while a set and the same set with one stray outlier are not. A set function is continuous with respect to it if moving the points slightly, in this sense, changes its value only slightly.
+
+## Universal approximation
+
+The first theorem says that the architecture loses nothing in principle: any continuous set function can be approximated.
+
+<Statement {...universalApproximation} />
+
+<Proof>
+
+The paper's supplementary material proves the case $m = 1$, of sets of numbers in $[0, 1]$; the idea carries over to higher dimensions. By continuity, choose $\delta$ such that $|f(S) - f(S')| < \varepsilon$ whenever $d_H(S, S') < \delta$, and let $K = \lceil 1/\delta \rceil$. Divide $[0, 1]$ into $K$ equal intervals, and let $\sigma(x) = \lfloor Kx \rfloor / K$ move each point to the left end of its interval. The set $\tilde S = \{\sigma(x) : x \in S\}$ is within $1/K \le \delta$ of $S$ in Hausdorff distance, so $|f(S) - f(\tilde S)| < \varepsilon$.
+
+Now let $h_k(x) = e^{-d(x, [\frac{k-1}{K}, \frac{k}{K}])}$, a soft indicator that equals $1$ on the $k$-th interval and decays away from it, and $h = (h_1, \dots, h_K)$. The elementwise maximum of $h$ over the points of $S$ records which intervals contain a point of $S$: the paper treats it as an occupancy vector $v \in \{0, 1\}^K$, and it does not depend on the order of the points. The map $\tau$ that sends an occupancy vector to the set of left ends of the occupied intervals recovers exactly $\tilde S$. Choosing a continuous $\gamma$ with $\gamma(v) = f(\tau(v))$ on occupancy vectors gives $\gamma(\operatorname{MAX}\{h(x_i)\}) = f(\tilde S)$, which is within $\varepsilon$ of $f(S)$.
+
+</Proof>
+
+The construction is a voxelisation: in the worst case, the network can learn to convert the points into an occupancy grid and compute the function from that. The authors remark that in practice it learns a much more economical way of probing space, which the second theorem and the visualisations explore.
+
+## Critical point sets
+
+The second theorem explains PointNet's robustness to missing and extra points. Write $u(S) = \operatorname{MAX}_{\bfx_i \in S}\{h(\bfx_i)\}$ for the $K$-dimensional pooled feature, so that $f = \gamma \circ u$.
+
+<Statement {...criticalPointSet} />
+
+<Proof>
+
+The output $f(S)$ is determined by $u(S)$. For each coordinate $j$ of $u$, the maximum $u_j(S)$ is attained by at least one point $\bfx_j \in S$, with $h_j(\bfx_j) = u_j(S)$. Let $C_S$ be the set of these points, one for each coordinate, so $|C_S| \le K$. Any set containing $C_S$ attains at least these maxima, and adding any point $\bfx$ with $h(\bfx) \le u(S)$ in every coordinate raises none of them, so $u$, and with it $f$, is unchanged. Taking $N_S$ to be the set of all such points gives the result.
+
+</Proof>
+
+The paper calls $C_S$ the _critical point set_ of $S$ and $K$ the _bottleneck dimension_. The output is determined by at most $K$ points, every other point of the input can be deleted, and any number of points can be added inside the _upper-bound shape_ $N_S$, without changing the result. Combined with the continuity of $h$, this explains why small perturbations, deletions and insertions change the output little. The authors liken it to the sparsity principle in machine learning: the network summarises a shape by a sparse set of key points.
+
+<CriticalPoints />
+
+Visualising the critical sets of trained networks on ModelNet shapes, the authors find that they trace the _skeleton_ of each object, and they build upper-bound shapes by passing every point of a cube through the network and keeping those whose point-function values nowhere exceed the global feature.
+
+# Experiments
+
+## Object classification
+
+On **ModelNet40**, $12{,}311$ CAD models in $40$ categories, split into $9{,}843$ for training and $2{,}468$ for testing, the authors sample $1024$ points uniformly over each mesh's faces, normalise them into a unit sphere, and augment training data by random rotation about the vertical axis and Gaussian jitter of standard deviation $0.02$.
+
+| Method | Input | Views | Average class accuracy | Overall accuracy |
+| --- | --- | --- | --- | --- |
+| 3DShapeNets | volume | 1 | 77.3 | 84.7 |
+| VoxNet | volume | 12 | 83.0 | 85.9 |
+| Subvolume | volume | 20 | 86.0 | 89.2 |
+| MVCNN | image | 80 | 90.1 | — |
+| Baseline (MLP on hand-crafted features) | point | — | 72.6 | 77.4 |
+| PointNet | point | 1 | 86.2 | 89.2 |
+
+PointNet matched or exceeded every method working on 3D input, volumetric or point, while a multi-view image method remained ahead, which the authors attribute to fine geometric detail captured by rendered images.
+
+## Part segmentation
+
+On the **ShapeNet part** dataset, $16{,}881$ shapes in $16$ categories annotated with $50$ parts, part segmentation is per-point classification scored by mean intersection over union (mIoU). PointNet reached $83.7$ mIoU, against $81.4$ for the best previous method and $79.4$ for a 3D convolutional baseline the authors built, an improvement of $2.3$ points, winning in most categories. Trained and tested on simulated partial Kinect scans of the same shapes, it lost only $5.3$ points of mIoU.
+
+## Semantic segmentation of scenes
+
+On the **Stanford 3D semantic parsing** dataset (S3DIS), scans of $271$ rooms in $6$ areas with every point labelled as one of $13$ classes, rooms are divided into blocks of $1 \times 1$ m, each point is described by nine numbers (coordinates, colour and its normalised position in the room), and $4096$ points per block are sampled during training. PointNet reached a mean IoU of $47.71$ and an overall accuracy of $78.62\%$, against $20.12$ and $53.19\%$ for a baseline classifying hand-crafted point features (including density, curvature and normal). Turning the segmentation into object detection by [connected-component clustering](../clustering-and-bounding-boxes/#euclidean-clustering) of points with the same predicted label (search radius $0.2$ m, clusters of over $200$ points), it improved the mean average precision over four furniture classes from $18.22$ to $24.24$ against a previous sliding-shape method.
+
+## Design choices
+
+**Order invariance.** Comparing a perceptron on unsorted and on sorted points, a recurrent network on the points as a sequence, and symmetric functions (max pooling, average pooling and an attention-weighted sum) on ModelNet40, max pooling performed best by a large margin.
+
+**Transforms.** The overall accuracy on ModelNet40 with each combination of alignment networks was as follows.
+
+| Transform | Accuracy |
+| --- | --- |
+| none | 87.1 |
+| input ($3 \times 3$) | 87.9 |
+| feature ($64 \times 64$) | 86.9 |
+| feature ($64 \times 64$) with regulariser | 87.4 |
+| both | 89.2 |
+
+The feature transform hurts without the regulariser [](eq:regulariser) and helps with it, and the two transforms together give the best result.
+
+**Robustness.** With half the input points deleted, accuracy fell by only $2.4\%$ when points were dropped by furthest-point sampling and $3.8\%$ when dropped at random. Trained with outliers, the network stayed above $80\%$ accuracy with $20\%$ of the points replaced by outliers. In a direct comparison on missing points, a volumetric network (VoxNet) fell from $86.3\%$ to $46.0\%$ with half the points missing while PointNet fell by $3.7$ points, as the critical-point analysis predicts.
+
+**Bottleneck and input size.** Accuracy grew with the number of input points but saturated around $1000$, and increasing the bottleneck dimension $K$ from $64$ to $1024$ gained $2$ to $4$ points, which the authors read as the network needing enough point functions to cover the space.
+
+## Efficiency
+
+| Network | Parameters | FLOPs per sample |
+| --- | --- | --- |
+| PointNet without transforms | 0.8 M | 148 M |
+| PointNet | 3.5 M | 440 M |
+| Subvolume | 16.6 M | 3633 M |
+| MVCNN | 60.0 M | 62057 M |
+
+PointNet was $141$ times cheaper than MVCNN and $8$ times cheaper than Subvolume in computation, with $17$ times fewer parameters than MVCNN, and its cost grows linearly in the number of points, where volumetric methods grow cubically with the grid's resolution and image methods quadratically with the image's. On one GPU it processed over a million points per second.
+
+# Assessment
+
+PointNet's lasting contribution is the pattern of [](eq:decomposition): a shared per-point network followed by a symmetric pooling, which respects the fact that a point cloud is a set and costs time linear in the number of points. The theorems make the pattern principled, showing that it can approximate any continuous set function and that its output depends on a bounded critical set, which accounts for its robustness.
+
+Its main limitation, from the standpoint of LiDAR, follows from the same design. Each point's feature is computed independently, and the only interaction between points is the single global maximum, so the network does not capture the local structure, the arrangement of neighbouring points, that the authors themselves list as the second property of point sets. Its successor, PointNet++, addressed this by applying PointNet hierarchically within local neighbourhoods, as the crash course [describes](../deep-learning-on-point-clouds/#pointnet-2). And the experiments concern CAD objects normalised into a unit sphere and indoor rooms cut into one-metre blocks, not the large, sparse, range-dependent scans of a driving LiDAR. In driving, PointNet's lasting role is as a component: the encoder that summarises the points within each voxel or pillar of a [VoxelNet](../deep-learning-on-point-clouds/#voxelnet-and-sparse-convolution) or [PointPillars](../deep-learning-on-point-clouds/#pointpillars) detector, where the points are few, local and already grouped, which is exactly the setting in which a shared network and a max-pool excel.

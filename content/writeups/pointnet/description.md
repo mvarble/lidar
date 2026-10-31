@@ -1,0 +1,1 @@
+A companion to Qi, Su, Mo and Guibas's PointNet (2017): the first network to consume raw point sets, built from a shared per-point network and max pooling, with its alignment networks, its universal-approximation and critical-point-set theorems, and its experiments.
