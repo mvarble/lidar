@@ -1,0 +1,1 @@
+A companion to Yin, Zhou and Krähenbühl's CenterPoint (2021): detecting LiDAR objects as heatmap peaks at their centres with every property regressed there, a cheap second stage on face-centre features, and tracking by greedy matching of velocity-compensated centres.

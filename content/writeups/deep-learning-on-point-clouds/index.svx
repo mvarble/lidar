@@ -1,6 +1,7 @@
 ---
 title: Deep learning on point clouds
 created: 2026-10-30
+updated: 2026-10-31
 depends_on: [neighbour-search, clustering-and-bounding-boxes]
 ---
 
@@ -80,7 +81,7 @@ where the subscripts $g$ and $a$ mark the ground truth and the anchor. The sine 
 
 ## Centre-based heads
 
-CenterPoint [](cite:yin2021) represents each object by its centre. For each class, the head predicts a _heatmap_ over the bird's-eye grid, trained against targets in which each ground-truth centre is a small Gaussian bump, and at each cell it regresses the sub-cell offset of the centre, its height, its size (as logarithms), its heading (as the sine and cosine of $\theta$, which avoids the discontinuity of the angle itself) and its velocity. Objects are read off as the local maxima of the heatmap. Representing objects by points rather than boxes removes the need to design anchors, handles rotated objects naturally, and, through the predicted velocity, provides the association for the simple tracker described in [Multi-object tracking](../multi-object-tracking/#assignment). A light second stage refines each box using features sampled from its faces. Centre-based heads are now standard.
+CenterPoint [](cite:yin2021) represents each object by its centre. For each class, the head predicts a _heatmap_ over the bird's-eye grid, trained against targets in which each ground-truth centre is a small Gaussian bump, and at each cell it regresses the sub-cell offset of the centre, its height, its size (as logarithms), its heading (as the sine and cosine of $\theta$, which avoids the discontinuity of the angle itself) and its velocity. Objects are read off as the local maxima of the heatmap. Representing objects by points rather than boxes removes the need to design anchors, handles rotated objects naturally, and, through the predicted velocity, provides the association for the simple tracker described in [Multi-object tracking](../multi-object-tracking/#assignment). A light second stage refines each box using features sampled from its faces. Centre-based heads are now standard; the writeup of [the CenterPoint paper](../centerpoint/) works through it in detail.
 
 ## Non-maximum suppression
 
@@ -98,7 +99,7 @@ def nms(boxes, scores, iou, threshold=0.5):
     return keep
 ```
 
-For oriented boxes in the bird's-eye view the IoU is that of two rotated rectangles, computed by clipping one polygon against the other. Greedy NMS costs $O(n^2)$ in the worst case for $n$ detections, and is usually applied per class after discarding detections below a confidence floor. CenterPoint largely replaces it by taking only heatmap cells that are maxima within a small window, a max-pooling operation, though NMS is still applied in some configurations.
+For oriented boxes in the bird's-eye view the IoU is that of two rotated rectangles, computed by clipping one polygon against the other. Greedy NMS costs $O(n^2)$ in the worst case for $n$ detections, and is usually applied per class after discarding detections below a confidence floor. Centre-based heads read objects off as heatmap cells that are maxima within a small window, a max-pooling operation that removes many duplicates by itself, though CenterPoint still applies NMS to its first-stage boxes before refining them.
 
 # Evaluation
 

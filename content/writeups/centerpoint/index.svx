@@ -1,0 +1,190 @@
+---
+title: 'CenterPoint: Center-based 3D Object Detection and Tracking'
+created: 2026-10-31
+depends_on: [deep-learning-on-point-clouds, multi-object-tracking]
+katex_macros:
+    '\hatY': '\hat{Y}'
+---
+
+<script>
+    import Anchors from './Anchors.svelte';
+</script>
+
+This writeup is a companion to the paper _Center-based 3D Object Detection and Tracking_ by Tianwei Yin, Xingyi Zhou and Philipp Krähenbühl [](cite:yin2021), presented at CVPR in 2021. The paper changes one thing about LiDAR object detectors, the representation of an object at the network's output, and shows that the change improves detection, simplifies a second refinement stage, and reduces tracking to matching points. Instead of boxes enumerated as anchors, an object is a point: the centre of its box, found as a peak in a heatmap, with every other property regressed at that point. The resulting detector, CenterPoint, was adopted by three of the top four entries of the 2020 nuScenes detection challenge, and centre-based heads are now the standard way of detecting objects in LiDAR.
+
+The paper builds on the following material from the crash course:
+
+- [Deep learning on point clouds](../deep-learning-on-point-clouds/), for the [voxel and pillar backbones](../deep-learning-on-point-clouds/#networks-on-voxels-and-pillars) CenterPoint uses unchanged, the [anchor-based heads](../deep-learning-on-point-clouds/#anchor-based-heads) it replaces, [non-maximum suppression](../deep-learning-on-point-clouds/#non-maximum-suppression), and the [benchmarks and metrics](../deep-learning-on-point-clouds/#evaluation) of KITTI, nuScenes and Waymo;
+- [Multi-object tracking](../multi-object-tracking/), for tracking by detection, [assignment](../multi-object-tracking/#assignment), [track management](../multi-object-tracking/#track-management) and the [AMOTA and MOTA metrics](../multi-object-tracking/#evaluation);
+- [Coordinate frames, rigid transforms and calibration](../frames-and-transforms/), for the [bird's-eye view](../frames-and-transforms/#projection-into-images-and-grids).
+
+# The problem with boxes
+
+The authors begin from three ways in which detection in point clouds differs from detection in images: point clouds are sparse, with most of space unmeasured; the output is a 3D box that is often not aligned with any global frame; and objects vary widely in size and aspect ratio, from nearly flat bicycles to long buses and tall pedestrians. Most 3D detectors had inherited the machinery of 2D detection, in which a head classifies and refines a set of predefined boxes, _anchors_, at every location. The paper's argument is that an axis-aligned box is a poor proxy for a freely rotating object, and that enumerating a separate anchor for each orientation adds computation and false positives.
+
+The figure shows the difficulty concretely. A head with anchors at $0°$ and $90°$ assigns an object to an anchor whose bird's-eye-view IoU with it exceeds a threshold, $0.55$ for vehicles in the setting the paper compares against, and a car turned part way through a junction overlaps neither anchor well enough. The thresholds themselves must be chosen per class and per dataset, which the authors call an unnecessary burden.
+
+<Anchors />
+
+## Objects as points
+
+The alternative comes from CenterNet, a 2D detector that treats detection as keypoint estimation. For an image, CenterNet predicts a heatmap $\hatY \in [0, 1]^{w \times h \times K}$ for each of $K$ classes, trained against targets in which a Gaussian kernel is rendered at the centre of each annotated object. Each local maximum of the heatmap, a pixel greater than its eight neighbours, is a detected object, with confidence given by the peak's value; its size, and an offset correcting for the quantisation of the backbone's stride, are read from dense regression maps at the same pixel. Non-maximum suppression may still be applied, depending on the application.
+
+A point has no orientation, which the authors identify as the representation's first advantage: the detector no longer has to search over orientations, and the backbone can learn the rotational invariance of objects. The second is that if objects are points, tracks are paths of points through space and time, so tracking becomes simple. The third is that the features at a few points of a predicted object make an efficient second stage.
+
+# Detection as the paper sets it up
+
+The input is an unordered point cloud $P = \{(x, y, z, r)_i\}$ of positions and reflectances, and the output is a set of boxes $b = (u, v, d, w, l, h, \alpha)$: a centre $(u, v, d)$ relative to the ground plane, a size $(w, l, h)$, and a yaw $\alpha$, in a frame centred on the sensor. CenterPoint keeps the standard first half of a LiDAR detector: a 3D encoder quantises the points into voxels or pillars, a [PointNet](../deep-learning-on-point-clouds/#pointnet) summarises the points of each, and a backbone, VoxelNet-style [sparse convolutions](../deep-learning-on-point-clouds/#voxelnet-and-sparse-convolution) or [PointPillars](../deep-learning-on-point-clouds/#pointpillars), produces a bird's-eye feature map $M \in \bbR^{W \times L \times F}$. The paper's contribution is entirely in what follows the backbone, and it is compatible with any of them; the experiments use both, as _CenterPoint-Voxel_ and _CenterPoint-Pillar_.
+
+# The first stage
+
+From $M$, the first stage predicts, densely at every cell, a class-specific heatmap and a set of regression targets.
+
+## The centre heatmap
+
+The heatmap head produces $K$ channels, one per class. Its training target places a 2D Gaussian at the bird's-eye projection of each annotated box's centre, and it is trained with a focal loss. The paper cites the variant used by CornerNet and CenterNet without restating it; in that variant, with $Y$ the target and $\hatY$ the prediction at each cell and channel, and $N$ the number of objects,
+
+$$
+	L_{\mathrm{heat}} = -\frac{1}{N} \sum \begin{cases}
+		(1 - \hatY)^{\alpha} \log \hatY, & Y = 1, \\
+		(1 - Y)^{\beta}\, \hatY^{\alpha} \log(1 - \hatY), & \text{otherwise},
+	\end{cases}
+$$
+
+with $\alpha = 2$ and $\beta = 4$ in CenterNet: the factor $(1 - Y)^\beta$ reduces the penalty for predicting a peak near, but not exactly at, a true centre.
+
+The authors point out a difference between images and the bird's-eye view that matters here. In the bird's-eye view, distances are absolute and objects are small: vehicles occupy a small part of a road scene seen from above, whereas in an image a few near objects can fill most of the frame. With CenterNet's standard targets, almost every cell would be background and the supervision would be very sparse. CenterPoint therefore enlarges the Gaussians, setting their radius to $\sigma = \max(f(wl), \tau)$, where $f$ is the size-dependent radius function of CornerNet and $\tau = 2$ cells is the smallest radius allowed, so that cells near each centre also provide supervision.
+
+## Regression heads
+
+At each object's centre, separate heads regress:
+
+- a sub-voxel location refinement $\bfo \in \bbR^2$, correcting the quantisation of voxelisation and of the backbone's stride;
+- the height above ground $h_g \in \bbR$, restoring the elevation that the bird's-eye view removes;
+- the 3D size $\bfs \in \bbR^3$, regressed as logarithms to handle boxes of very different shapes;
+- the yaw, as the pair $(\sin\alpha, \cos\alpha)$, a continuous target without the wrap-around of the angle itself.
+
+Only the cells at ground-truth centres are supervised, with an L1 loss. At inference, every property is read by indexing the dense regression outputs at each heatmap peak.
+
+## The velocity head
+
+To track, CenterPoint regresses one more property, a two-dimensional velocity $\bfv \in \bbR^2$ for each object, defined as the difference in its position between the current and the previous frame. Unlike the others, it needs two inputs, the current and the previous map views, and it is supervised, like them, with an L1 loss at the object's centre in the current frame. In the nuScenes experiments, following common practice, the points of the unannotated sweeps between annotated frames are transformed and merged into the following annotated frame, which gives a denser cloud and the temporal information that velocity estimation needs.
+
+All the heatmap and regression losses are summed into one objective and optimised jointly.
+
+## The head's architecture
+
+All first-stage outputs share a first $3 \times 3$ convolution with batch normalisation and a ReLU. Each output then has its own branch of two $3 \times 3$ convolutions, separated by batch normalisation and a ReLU.
+
+# The second stage
+
+The first stage infers everything from the feature at an object's centre. The authors observe that this feature may not hold enough information for precise localisation: a LiDAR often sees only the side of an object, not its centre, and the backbone's striding and limited receptive field discard local geometry. A light second stage recovers some of it.
+
+For each first-stage box, the second stage takes features at the centre of each face of the box. The centres of the top and bottom faces project to the same bird's-eye point as the box's centre, so it uses five points: the centre and the centres of the four outward-facing side faces. The feature at each is bilinearly interpolated from the backbone's map $M$; the five are concatenated and passed through a perceptron, a shared two-layer stage with batch normalisation, ReLU and dropout of $0.3$, followed by two branches of three fully connected layers, which predict a refinement of the box and a class-agnostic confidence score.
+
+The confidence target follows earlier two-stage detectors in measuring the quality of a proposal by its 3D IoU with the ground truth, mapped to
+
+$$
+	I = \min\big(1, \max(0,\ 2 \times \mathrm{IoU}_t - 0.5)\big), @tag(score-target)
+$$
+
+where $\mathrm{IoU}_t$ is the IoU of the $t$-th proposal with its ground-truth box, and is learned with a binary cross-entropy,
+
+$$
+	L_{\mathrm{score}} = -I_t \log \hat I_t - (1 - I_t) \log(1 - \hat I_t).
+$$
+
+The box refinement is trained with an L1 loss. At inference, the class still comes from the first stage, and the final confidence is the geometric mean of the two stages' scores, $\hat Q_t = \sqrt{\hatY_t \cdot \hat I_t}$, where $\hatY_t$ is the first stage's highest class score for object $t$. During training, $128$ first-stage boxes are sampled per frame with equal numbers of positives and negatives, a proposal being positive if it overlaps a ground-truth box with an IoU of at least $0.55$; at inference, the second stage runs on the top $500$ first-stage predictions after non-maximum suppression.
+
+The point of the design is cost. Earlier two-stage LiDAR detectors pooled features from the raw points or voxels in each proposal with PointNet-based extractors or RoIAlign, which the authors describe as prohibitively slow. Sampling five points from a 2D feature map that already exists is cheap.
+
+# Tracking
+
+Because each detection carries a velocity, tracking needs no motion model of its own. The paper's Algorithm 1, given in its supplement, works as follows. Each tracked object from the previous frame holds a centre $\bfp$, a velocity, a class, its other box attributes, an identity and an _inactive age_, the number of frames since it was last matched. The current frame's detections are sorted by confidence. Each detection's centre is moved back by its predicted velocity, to where the object should have been in the previous frame, and the cost of pairing detection $i$ with track $j$ is the distance
+
+$$
+	F_{ij} = \big\lVert (\hat\bfp_i - \hat\bfv_i) - \bfp_j \big\rVert_2.
+$$
+
+Taking detections in order of confidence, each is matched _greedily_ to the nearest track not yet matched. If that distance is within a class-specific threshold, the detection continues the track and its age is reset to zero; otherwise it starts a new track. A track left unmatched is kept, with its age increased and its centre advanced by its last velocity, until it has gone unmatched for $T = 3$ frames, following SORT, after which it is deleted.
+
+Compared with the trackers described in the crash course, this omits the [Kalman filter](../multi-object-tracking/#the-kalman-filter), the [Mahalanobis gating](../multi-object-tracking/#gating) and the [Hungarian assignment](../multi-object-tracking/#assignment). The learned velocity takes the place of the filter's prediction, and the authors argue that it is the better predictor, since it is estimated from the point clouds of two frames rather than from a model of box dynamics. The tracker costs about a millisecond per frame.
+
+# Experiments
+
+## Datasets and settings
+
+**Waymo Open Dataset**: $798$ training and $202$ validation sequences, recorded with a 64-beam LiDAR giving about $180{,}000$ points every $0.1$ s. Detection is scored by mAP and by mAPH, mAP weighted by heading accuracy, at IoU thresholds of $0.7$ for vehicles and $0.5$ for pedestrians, at two difficulty levels: LEVEL 1 for boxes with more than five LiDAR points and LEVEL 2 for boxes with at least one. Tracking is scored by MOTA and MOTP. The detection range is $\pm 75.2$ m horizontally and $-2$ to $4$ m vertically, with voxels of $0.1 \times 0.1 \times 0.15$ m or pillars of $0.32 \times 0.32$ m.
+
+**nuScenes**: $1000$ sequences of about $20$ s ($700$, $150$ and $150$ for training, validation and testing), recorded with a 32-beam LiDAR at $20$ frames per second giving about $30{,}000$ points per frame, annotated every ten frames ($28{,}000$, $6{,}000$ and $6{,}000$ annotated frames) with ten long-tailed classes. Detection is scored by mAP with centre-distance thresholds of $0.5$, $1$, $2$ and $4$ m and by NDS, and, after the paper's submission, by a planning-based metric, PKL, that measures how detection errors affect a planner. Tracking is scored by AMOTA. The range is $\pm 51.2$ m horizontally and $-5$ to $3$ m vertically, with voxels of $0.1 \times 0.1 \times 0.2$ m or pillars of $0.2 \times 0.2$ m.
+
+**Training.** Data is augmented by random flips along both horizontal axes, global scaling by a factor in $[0.95, 1.05]$, and global rotation within $\pm\pi/8$ on nuScenes and $\pm\pi/4$ on Waymo, with [ground-truth sampling](../deep-learning-on-point-clouds/#training-on-lidar) on nuScenes to counter its long-tailed classes. Models are trained with AdamW under a one-cycle learning-rate policy (maximum $10^{-3}$, $3 \times 10^{-3}$ on Waymo), weight decay $0.01$ and momentum from $0.85$ to $0.95$, in batches of $16$ for $20$ epochs on nuScenes and $30$ on Waymo, with the second stage fine-tuned for six further epochs.
+
+## Main results
+
+On the **Waymo test set**, a single CenterPoint-Voxel model reached LEVEL 2 mAPH of $71.8$ for vehicles and $66.4$ for pedestrians, ahead of the previous best methods by $7.1$ and $10.6$ points.
+
+On the **nuScenes test set**, it reached $58.0$ mAP and $65.5$ NDS, against $52.8$ and $63.3$ for the previous year's challenge winner, which used multi-scale inputs and an ensemble of models, with the largest gains on small classes ($+5.6$ mAP on traffic cones) and classes of extreme aspect ratio ($+6.4$ on bicycles and $+7.0$ on construction vehicles). It was also best on the PKL planning metric, $0.69$ against $0.77$, which the authors note was computed after their submission and so could not have been tuned for.
+
+For **tracking**, CenterPoint reached $63.8$ AMOTA on the nuScenes test set, $8.8$ points above the previous best, with fewer identity switches ($760$ against $950$), and LEVEL 2 MOTA of $59.4$ for vehicles and $56.6$ for pedestrians on the Waymo test set, against $40.1$ and $37.7$ for the official Kalman-filter baseline.
+
+The complete system ran at $11$ frames per second on Waymo and $16$ on nuScenes, on an Intel Core i7 and a Titan RTX.
+
+## Centres against anchors
+
+The central ablation swaps the centre-based head for an anchor-based one with everything else unchanged, following the anchor settings of the strongest anchor-based methods: two anchors per location at $0°$ and $90°$, with positive and negative IoU thresholds of $0.55$ and $0.4$ for vehicles and $0.5$ and $0.35$ for pedestrians on Waymo.
+
+| Encoder | Head | Waymo vehicle | Waymo pedestrian | Waymo mean | nuScenes mAP | nuScenes NDS |
+| --- | --- | --- | --- | --- | --- | --- |
+| VoxelNet | anchor | 66.1 | 54.4 | 60.3 | 52.6 | 63.0 |
+| VoxelNet | centre | 66.5 | 62.7 | 64.6 | 56.4 | 64.8 |
+| PointPillars | anchor | 64.1 | 50.8 | 57.5 | 46.2 | 59.1 |
+| PointPillars | centre | 66.5 | 57.4 | 62.0 | 50.3 | 60.2 |
+
+The Waymo columns are LEVEL 2 mAPH on the validation set, and the nuScenes columns are on its validation set. Switching to centres gained $4.3$ and $4.5$ mAPH on Waymo and $3.8$ to $4.1$ mAP on nuScenes, across both backbones.
+
+To see where the gains come from, the authors split Waymo's validation objects by heading, relative to the axes, and by size. By heading:
+
+| Head | Vehicle 0–15° | Vehicle 15–30° | Vehicle 30–45° | Pedestrian 0–15° | Pedestrian 15–30° | Pedestrian 30–45° |
+| --- | --- | --- | --- | --- | --- | --- |
+| share of objects | 81.4% | 10.5% | 8.1% | 71.4% | 15.8% | 12.8% |
+| anchor | 67.1 | 47.7 | 45.4 | 55.9 | 32.0 | 26.5 |
+| centre | 67.8 | 46.4 | 51.6 | 64.0 | 42.1 | 35.7 |
+
+The centre-based head gains most on the most rotated objects, $+6.2$ for vehicles at $30°$ to $45°$, though it is slightly behind for vehicles at $15°$ to $30°$. By size, it gains most on pedestrians, by about nine points in each third from small to large, and modestly on small and large vehicles. The authors conclude that the centre-based detector captures invariance to rotation and size better.
+
+## The second stage
+
+| Encoder | Second stage | Vehicle | Pedestrian | Added time |
+| --- | --- | --- | --- | --- |
+| VoxelNet | none | 66.5 | 62.7 | (71 ms in all) |
+| VoxelNet | box centre | 68.0 | 64.9 | 5 ms |
+| VoxelNet | box and face centres | 68.3 | 65.3 | 6 ms |
+| VoxelNet | dense $6 \times 6$ sampling | 68.2 | 65.4 | 8 ms |
+| PointPillars | none | 66.5 | 57.4 | (56 ms in all) |
+| PointPillars | box and face centres | 67.5 | 57.9 | 7 ms |
+
+On Waymo's validation set (LEVEL 2 mAPH), the five-point second stage added about two points for $6$ to $7$ ms, and matched dense RoIAlign-style sampling of $6 \times 6$ points at less cost. It helped pedestrians little with pillars, since a pedestrian typically occupies a single pillar. Replacing the bird's-eye features with the voxel features used by earlier two-stage methods, through PV-RCNN's voxel set abstraction or radial-basis interpolation, did not improve the results and was slower ($98$ and $89$ ms against $77$ ms). On nuScenes, the second stage brought no improvement, which the authors attribute to its 32-beam sensor giving about a sixth as many points as Waymo's.
+
+## Tracking
+
+On nuScenes validation, the authors separate the contributions of detector and tracker by crossing two detectors with two trackers.
+
+| Detector | Tracker | AMOTA | Tracking time | Total time |
+| --- | --- | --- | --- | --- |
+| CenterPoint-Voxel | CenterPoint | 63.7 | 1 ms | 62 ms |
+| CBGS | CenterPoint | 59.8 | 1 ms | over 182 ms |
+| CenterPoint-Voxel | Kalman filter, Mahalanobis | 60.0 | 73 ms | 135 ms |
+| CBGS | Kalman filter, Mahalanobis | 56.1 | 73 ms | over 254 ms |
+
+With either detector, the velocity-based greedy tracker beat the Kalman-filter tracker of the previous challenge winner by $3.7$ AMOTA, at a seventieth of the cost. The authors attribute the gain to modelling motion with a learned velocity rather than a filter on box states, and to matching by centre distance rather than by Mahalanobis distance or box IoU.
+
+## The challenge entry
+
+For the 2020 nuScenes challenge, the authors added [PointPainting](../deep-learning-on-point-clouds/#fusion-with-cameras), decorating each point with image instance-segmentation scores ($65.4$ to $68.0$ NDS on validation), double-flip testing and rotations about the vertical axis at test time (to $70.3$), an ensemble of five models with grid sizes from $0.05$ to $0.15$ m (to $71.4$), and removal of predictions containing no points (to $71.7$ NDS and $68.2$ mAP).
+
+# Assessment
+
+CenterPoint's contribution is a change of representation with consequences throughout the pipeline. Representing objects by their centres removes the orientation-dependent anchor matching that handicapped rotated and unusually shaped objects; it makes a cheap second stage natural; and with a learned velocity it reduces tracking to greedy nearest-point matching that outperformed filter-based trackers at a fraction of the cost. Its design is also modular: it changes only the head, so it improved every backbone it was tried with.
+
+Some limits are visible in the paper itself. The greedy tracker has no mechanism to resolve ambiguous associations, which the crash course's [more careful association methods](../multi-object-tracking/#assignment) address, and its coasting of unmatched tracks for only three frames, by their last velocity, keeps identities through short occlusions but not long ones. The second stage's benefit depends on point density, vanishing on the sparser nuScenes data. And the first stage still applies non-maximum suppression before the second stage, so the centre representation does not by itself remove duplicate suppression from the pipeline. The approach of predicting a heatmap of centres in the bird's-eye view, with properties regressed at the peaks, nevertheless became the default head for LiDAR detectors, including those built on the transformer backbones that followed.
